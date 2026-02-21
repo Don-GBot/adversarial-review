@@ -1,0 +1,8 @@
+{
+  "name": "cross-model-review",
+  "version": "1.0.0",
+  "description": "Adversarial plan review using two different AI models",
+  "keywords": ["code-review", "multi-model", "adversarial", "planning", "quality"],
+  "author": "Don-GBot",
+  "license": "MIT"
+}
