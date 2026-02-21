@@ -1,3 +1,8 @@
+---
+name: cross-model-review
+description: Adversarial plan review using two different AI models. Planner writes, reviewer challenges, they iterate until approved. Use when building features touching auth/payments/data models, or plans >1hr to implement. NOT for simple fixes, research tasks, or quick scripts.
+---
+
 # cross-model-review
 
 ## Metadata
