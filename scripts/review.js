@@ -15,8 +15,6 @@
 
 const fs   = require('fs');
 const path = require('path');
-const os   = require('os');
-const { execSync } = require('child_process');
 
 // ---------------------------------------------------------------------------
 // Argument parsing — minimal, no external deps
@@ -77,6 +75,27 @@ function ensureDir(dir) {
   fs.mkdirSync(dir, { recursive: true });
 }
 
+/**
+ * Read one line from stdin synchronously (for TTY confirmation prompts).
+ * Uses fs.readSync on fd 0 to avoid external deps or async complexity.
+ */
+function readLineSync() {
+  const buf = Buffer.allocUnsafe(1);
+  let result = '';
+  try {
+    while (true) {
+      const bytesRead = fs.readSync(0, buf, 0, 1, null);
+      if (bytesRead === 0) break;
+      const char = buf.slice(0, 1).toString('utf8');
+      if (char === '\n') break;
+      if (char !== '\r') result += char;
+    }
+  } catch (_) {
+    // stdin not readable (non-TTY, pipe, etc.)
+  }
+  return result.trim();
+}
+
 // ---------------------------------------------------------------------------
 // Model family detection — prevent same-provider review
 // ---------------------------------------------------------------------------
@@ -96,7 +115,9 @@ function detectFamily(modelId) {
       if (lower.includes(kw)) return family;
     }
   }
-  return lower.split('/')[0] || 'unknown';
+  // Fall back to the first path segment (e.g. "myprovider/model-name" → "myprovider")
+  const firstSegment = lower.split('/')[0];
+  return (firstSegment && firstSegment !== lower) ? firstSegment : 'unknown';
 }
 
 // ---------------------------------------------------------------------------
@@ -139,9 +160,9 @@ function nextIssueId(issues) {
 // ---------------------------------------------------------------------------
 // Review schema validation
 // ---------------------------------------------------------------------------
-const VALID_VERDICTS  = new Set(['APPROVED', 'REVISE']);
+const VALID_VERDICTS   = new Set(['APPROVED', 'REVISE']);
 const VALID_SEVERITIES = new Set(['CRITICAL', 'HIGH', 'MEDIUM', 'LOW']);
-const VALID_STATUSES  = new Set(['resolved', 'still-open', 'regressed', 'not-applicable']);
+const VALID_STATUSES   = new Set(['resolved', 'still-open', 'regressed', 'not-applicable']);
 
 function validateReviewResponse(obj) {
   const errors = [];
@@ -234,16 +255,28 @@ function cmdInit(args) {
   const reviewerModel = args['reviewer-model'];
   const plannerModel  = args['planner-model'];
   const outBase       = args['out'] || path.join(process.cwd(), 'tasks/reviews');
+  const maxRounds     = parseInt(args['max-rounds'] || '5', 10);
+  const tokenBudget   = parseInt(args['token-budget'] || '8000', 10);
 
   if (!planPath)      die('--plan <file> is required');
   if (!reviewerModel) die('--reviewer-model <model> is required');
   if (!plannerModel)  die('--planner-model <model> is required');
 
+  if (isNaN(maxRounds) || maxRounds < 1)   die('--max-rounds must be a positive integer');
+  if (isNaN(tokenBudget) || tokenBudget < 1) die('--token-budget must be a positive integer');
+
   if (!fs.existsSync(planPath)) die(`Plan file not found: ${planPath}`);
 
   const rFamily = detectFamily(reviewerModel);
   const pFamily = detectFamily(plannerModel);
-  if (rFamily === pFamily && rFamily !== 'unknown') {
+
+  if (rFamily === 'unknown' && pFamily === 'unknown') {
+    console.warn(`WARNING: Both reviewer (${reviewerModel}) and planner (${plannerModel}) resolved to unknown provider family. Cannot verify cross-provider constraint. Proceeding anyway.`);
+  } else if (rFamily === 'unknown') {
+    console.warn(`WARNING: Reviewer model (${reviewerModel}) resolved to unknown provider family. Cannot verify it differs from planner (${pFamily}). Proceeding anyway.`);
+  } else if (pFamily === 'unknown') {
+    console.warn(`WARNING: Planner model (${plannerModel}) resolved to unknown provider family. Cannot verify it differs from reviewer (${rFamily}). Proceeding anyway.`);
+  } else if (rFamily === pFamily) {
     die(`Reviewer and planner are from the same provider family (${rFamily}). Cross-provider review required.`);
   }
 
@@ -260,12 +293,13 @@ function cmdInit(args) {
 
   // Write meta
   const meta = {
-    created:       new Date().toISOString(),
+    created:        new Date().toISOString(),
     reviewerModel,
     plannerModel,
     reviewerFamily: rFamily,
     plannerFamily:  pFamily,
-    maxRounds:      5,
+    maxRounds,
+    tokenBudget,
     currentRound:   0,
     verdict:        'PENDING',
     wsDir,
@@ -330,6 +364,7 @@ function cmdParseRound(args) {
   }
 
   // ---- Dedup check on new issues ----
+  // Check each new issue against: (a) existing open issues AND (b) other new issues in this batch
   const openIssues = issues.filter(i => i.status === 'open' || i.status === 'still-open' || i.status === 'regressed');
   const dedupWarnings = [];
   const assignedNewIssues = [];
@@ -339,6 +374,7 @@ function cmdParseRound(args) {
     let maxSim = 0;
     let dupOf  = null;
 
+    // Check against existing open issues from prior rounds
     for (const open of openIssues) {
       const sim = jaccardSimilarity(ni.problem, open.problem);
       if (sim > maxSim) {
@@ -347,9 +383,18 @@ function cmdParseRound(args) {
       }
     }
 
+    // Check against other new issues already assigned in this same batch (intra-batch dedup)
+    for (const prev of assignedNewIssues) {
+      const sim = jaccardSimilarity(ni.problem, prev.problem);
+      if (sim > maxSim) {
+        maxSim = sim;
+        dupOf  = prev.id;
+      }
+    }
+
     if (maxSim >= 0.6) {
       dedupWarnings.push({
-        new_issue_index:      idx,
+        new_issue_index:       idx,
         possible_duplicate_of: dupOf,
         similarity:            Math.round(maxSim * 100) / 100,
         note: `New issue overlaps significantly with ${dupOf}. Confirm if distinct.`,
@@ -376,8 +421,8 @@ function cmdParseRound(args) {
   saveIssues(wsDir, issues);
 
   // ---- Approval gate ----
-  const blockers    = getOpenBlockers(issues);
-  let finalVerdict  = parsed.verdict;
+  const blockers   = getOpenBlockers(issues);
+  let finalVerdict = parsed.verdict;
 
   if (finalVerdict === 'APPROVED' && blockers.length > 0) {
     console.error(`WARNING: Reviewer said APPROVED but ${blockers.length} CRITICAL/HIGH issue(s) are still open.`);
@@ -442,8 +487,8 @@ function cmdFinalize(args) {
   if (!wsDir) die('--workspace <dir> is required');
   if (!fs.existsSync(wsDir)) die(`Workspace not found: ${wsDir}`);
 
-  const meta   = getWorkspaceMeta(wsDir);
-  const issues = getIssues(wsDir);
+  const meta     = getWorkspaceMeta(wsDir);
+  const issues   = getIssues(wsDir);
   const blockers = getOpenBlockers(issues);
 
   let forceApproveLog = null;
@@ -463,44 +508,35 @@ function cmdFinalize(args) {
     const isTTY = process.stdin.isTTY && process.stdout.isTTY;
 
     if (isTTY && !ciForce) {
-      // Interactive confirmation
-      const { execSync } = require('child_process');
+      // Interactive confirmation via readline (no execSync dependency)
       const warning = [
         '',
         '⚠️  FORCE APPROVE: This will bypass unresolved CRITICAL/HIGH issues.',
         `Unresolved: ${blockers.map(i => `${i.id}(${i.severity})`).join(', ')}`,
         `Override reason: "${overrideReason}"`,
-        'Type CONFIRM to proceed, or Ctrl-C to abort:',
-        '',
+        'Type CONFIRM to proceed, or Ctrl-C to abort: ',
       ].join('\n');
       process.stderr.write(warning);
 
-      let input = '';
-      try {
-        // Read one line from TTY
-        input = execSync('read -r line && echo "$line"', { stdio: ['inherit', 'pipe', 'inherit'], shell: true })
-          .toString().trim();
-      } catch (_) {}
-
+      const input = readLineSync();
       if (input !== 'CONFIRM') {
         die('Force-approve aborted (did not receive CONFIRM).', 1);
       }
-    } else if (!isTTY || ciForce) {
-      // Non-interactive: require both --override-reason AND --ci-force
-      if (!ciForce) {
-        die(
-          'Force-approve in non-interactive mode requires both --override-reason and --ci-force.',
-          2
-        );
-      }
+    } else if (!ciForce) {
+      // Non-interactive without --ci-force: reject
+      die(
+        'Force-approve in non-interactive mode requires both --override-reason and --ci-force.',
+        2
+      );
     }
+    // If ciForce is set, skip confirmation (non-interactive CI path)
 
     forceApproveLog = {
       actor:             process.env.USER || process.env.CI_ACTOR || 'unknown',
       reason:            overrideReason,
       timestamp:         new Date().toISOString(),
       unresolved_issues: blockers.map(i => i.id),
-      tty_confirmed:     (process.stdin.isTTY && process.stdout.isTTY && !ciForce),
+      tty_confirmed:     (isTTY && !ciForce),
       ci_force:          ciForce,
     };
 
@@ -528,8 +564,8 @@ function cmdFinalize(args) {
 
   // plan-final.md — clean copy without review comments
   const finalPlan = latestPlan
-    .replace(/<!--[\s\S]*?-->/g, '')   // strip HTML comments
-    .replace(/\n{3,}/g, '\n\n')        // collapse extra blank lines
+    .replace(/<!--[\s\S]*?-->/g, '')  // strip HTML comments
+    .replace(/\n{3,}/g, '\n\n')       // collapse extra blank lines
     .trim() + '\n';
   fs.writeFileSync(path.join(wsDir, 'plan-final.md'), finalPlan, 'utf8');
 
@@ -542,16 +578,17 @@ function cmdFinalize(args) {
     if (key in bySeverity) bySeverity[key]++;
   }
 
+  const isTTY = process.stdin.isTTY && process.stdout.isTTY;
   const summary = {
-    rounds:           meta.currentRound,
-    plannerModel:     meta.plannerModel,
-    reviewerModel:    meta.reviewerModel,
-    totalIssuesFound: totalFound,
-    issuesBySeverity: bySeverity,
-    issuesResolved:   totalResolved,
-    issuesUnresolved: totalFound - totalResolved,
-    finalVerdict:     blockers.length > 0 && forceApproveLog ? 'FORCE_APPROVED' : 'APPROVED',
-    completedAt:      new Date().toISOString(),
+    rounds:            meta.currentRound,
+    plannerModel:      meta.plannerModel,
+    reviewerModel:     meta.reviewerModel,
+    totalIssuesFound:  totalFound,
+    issuesBySeverity:  bySeverity,
+    issuesResolved:    totalResolved,
+    issuesUnresolved:  totalFound - totalResolved,
+    finalVerdict:      blockers.length > 0 && forceApproveLog ? 'FORCE_APPROVED' : 'APPROVED',
+    completedAt:       new Date().toISOString(),
     force_approve_log: forceApproveLog,
   };
   writeJson(path.join(wsDir, 'summary.json'), summary);
@@ -595,23 +632,23 @@ function cmdStatus(args) {
   if (!wsDir) die('--workspace <dir> is required');
   if (!fs.existsSync(wsDir)) die(`Workspace not found: ${wsDir}`);
 
-  const meta   = getWorkspaceMeta(wsDir);
-  const issues = getIssues(wsDir);
-  const open   = issues.filter(i => i.status === 'open' || i.status === 'still-open' || i.status === 'regressed');
+  const meta     = getWorkspaceMeta(wsDir);
+  const issues   = getIssues(wsDir);
+  const open     = issues.filter(i => i.status === 'open' || i.status === 'still-open' || i.status === 'regressed');
   const resolved = issues.filter(i => ['resolved', 'not-applicable', 'force-approved'].includes(i.status));
   const blockers = getOpenBlockers(issues);
 
   const out = {
-    workspace:     wsDir,
-    verdict:       meta.verdict,
-    currentRound:  meta.currentRound,
-    reviewerModel: meta.reviewerModel,
-    plannerModel:  meta.plannerModel,
-    totalIssues:   issues.length,
-    openIssues:    open.length,
+    workspace:      wsDir,
+    verdict:        meta.verdict,
+    currentRound:   meta.currentRound,
+    reviewerModel:  meta.reviewerModel,
+    plannerModel:   meta.plannerModel,
+    totalIssues:    issues.length,
+    openIssues:     open.length,
     resolvedIssues: resolved.length,
-    blockers:      blockers.map(i => ({ id: i.id, severity: i.severity, problem: i.problem })),
-    allIssues:     issues.map(i => ({
+    blockers:       blockers.map(i => ({ id: i.id, severity: i.severity, problem: i.problem })),
+    allIssues:      issues.map(i => ({
       id:       i.id,
       severity: i.severity,
       status:   i.status,
@@ -647,6 +684,8 @@ init options:
   --reviewer-model <m>     Reviewer model identifier (required)
   --planner-model <m>      Planner model identifier (required)
   --out <dir>              Output base directory (default: tasks/reviews)
+  --max-rounds <n>         Maximum review rounds (default: 5)
+  --token-budget <n>       Token budget for codebase context (default: 8000)
 
 parse-round options:
   --workspace <dir>        Path to review workspace (required)
@@ -668,6 +707,7 @@ Exit codes:
 
 Examples:
   node review.js init --plan /tmp/plan.md --reviewer-model openai/gpt-4 --planner-model anthropic/claude-sonnet-4-6
+  node review.js init --plan "/tmp/my plan.md" --reviewer-model openai/gpt-4 --planner-model anthropic/claude-sonnet-4-6 --max-rounds 3 --token-budget 4000
   node review.js parse-round --workspace tasks/reviews/2025-01-01T00-00-00-abc123 --round 1 --response /tmp/resp.json
   node review.js finalize --workspace tasks/reviews/2025-01-01T00-00-00-abc123
   node review.js status --workspace tasks/reviews/2025-01-01T00-00-00-abc123

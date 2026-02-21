@@ -30,7 +30,7 @@ function run(args, opts = {}) {
       return { ok: true, stdout: (e.stdout || '').trim(), code: 1 };
     }
     if (!expectFail) throw e;
-    return { ok: false, stderr: (e.stderr || '').trim(), code: e.status || 1 };
+    return { ok: false, stderr: (e.stderr || '').trim(), stdout: (e.stdout || '').trim(), code: e.status || 1 };
   }
 }
 
@@ -68,6 +68,8 @@ console.log('--- help ---');
   assert(r.stdout.includes('parse-round'), 'help mentions parse-round command');
   assert(r.stdout.includes('finalize'), 'help mentions finalize command');
   assert(r.stdout.includes('status'), 'help mentions status command');
+  assert(r.stdout.includes('--max-rounds'), 'help mentions --max-rounds');
+  assert(r.stdout.includes('--token-budget'), 'help mentions --token-budget');
 }
 
 // Test: init — success
@@ -89,12 +91,24 @@ const planPath = setup();
   assert(meta.reviewerModel === 'openai/codex', 'reviewer model stored');
   assert(meta.plannerModel === 'anthropic/sonnet', 'planner model stored');
   assert(meta.verdict === 'PENDING', 'initial verdict is PENDING');
+  assert(meta.maxRounds === 5, 'default maxRounds is 5');
+  assert(meta.tokenBudget === 8000, 'default tokenBudget is 8000');
 
   // Test: same-provider rejection
   console.log('\n--- init: same-provider rejection ---');
   const r2 = run(`init --plan ${planPath} --reviewer-model anthropic/opus --planner-model anthropic/sonnet --out ${outDir}`, { expectFail: true });
   assert(!r2.ok, 'same-provider init fails');
   assert(r2.code === 2, 'exits with code 2');
+
+  // Test: --max-rounds stored in meta
+  console.log('\n--- init: --max-rounds and --token-budget stored in meta ---');
+  const outDirMR = path.join(tmpDir, 'reviews-maxrounds');
+  const rMR = run(`init --plan ${planPath} --reviewer-model openai/codex --planner-model anthropic/sonnet --out ${outDirMR} --max-rounds 3 --token-budget 4000`);
+  assert(rMR.ok, 'init with --max-rounds and --token-budget exits 0');
+  const wsDirMR = rMR.stdout;
+  const metaMR = JSON.parse(fs.readFileSync(path.join(wsDirMR, 'meta.json'), 'utf8'));
+  assert(metaMR.maxRounds === 3, '--max-rounds 3 stored in meta.json');
+  assert(metaMR.tokenBudget === 4000, '--token-budget 4000 stored in meta.json');
 
   // Test: parse-round
   console.log('\n--- parse-round ---');
@@ -151,6 +165,10 @@ const planPath = setup();
   assert(fs.existsSync(path.join(wsDir, 'plan-final.md')), 'plan-final.md generated');
   assert(fs.existsSync(path.join(wsDir, 'summary.json')), 'summary.json generated');
 
+  // Test: verdict lives in meta.json (not issues.json)
+  const metaAfterFinalize = JSON.parse(fs.readFileSync(path.join(wsDir, 'meta.json'), 'utf8'));
+  assert(metaAfterFinalize.verdict === 'APPROVED', 'verdict stored in meta.json after finalize');
+
   // Test: status
   console.log('\n--- status ---');
   const r6 = run(`status --workspace ${wsDir}`);
@@ -158,8 +176,8 @@ const planPath = setup();
   assert(status.verdict === 'APPROVED', 'status shows APPROVED');
   assert(status.totalIssues === 3, 'status shows 3 total issues');
 
-  // Test: dedup detection
-  console.log('\n--- dedup detection ---');
+  // Test: dedup detection (cross-round, existing open issue)
+  console.log('\n--- dedup detection (cross-round) ---');
   const outDir2 = path.join(tmpDir, 'reviews2');
   const r7 = run(`init --plan ${planPath} --reviewer-model openai/codex --planner-model anthropic/sonnet --out ${outDir2}`);
   const wsDir2 = r7.stdout;
@@ -186,7 +204,27 @@ const planPath = setup();
   }));
   const r8 = run(`parse-round --workspace ${wsDir2} --round 2 --response ${dedupResp2}`, { allowExit1: true });
   const dedupOutput = JSON.parse(r8.stdout);
-  assert(dedupOutput.dedupWarnings > 0, 'dedup warning detected for similar issue');
+  assert(dedupOutput.dedupWarnings > 0, 'dedup warning detected for similar issue (cross-round)');
+
+  // Test: intra-batch dedup (two nearly-identical issues in the same round's new_issues)
+  console.log('\n--- dedup detection (intra-batch) ---');
+  const outDirIB = path.join(tmpDir, 'reviews-intrabatch');
+  const rIB = run(`init --plan ${planPath} --reviewer-model openai/codex --planner-model anthropic/sonnet --out ${outDirIB}`);
+  const wsDirIB = rIB.stdout;
+
+  const intraBatchResp = path.join(tmpDir, 'intra-batch-resp.json');
+  fs.writeFileSync(intraBatchResp, JSON.stringify({
+    verdict: 'REVISE',
+    prior_issues: [],
+    new_issues: [
+      { severity: 'HIGH', location: 'Auth', problem: 'No rate limiting on login endpoint allows brute force', fix: 'Add rate limiter' },
+      { severity: 'HIGH', location: 'Login', problem: 'No rate limiting on login endpoint allows brute force attacks', fix: 'Implement rate limiting middleware' },
+    ],
+    summary: '2 issues (probably duplicates)',
+  }));
+  const rIBResult = run(`parse-round --workspace ${wsDirIB} --round 1 --response ${intraBatchResp}`, { allowExit1: true });
+  const intraBatchOutput = JSON.parse(rIBResult.stdout);
+  assert(intraBatchOutput.dedupWarnings > 0, 'intra-batch dedup warning detected for two similar new issues in same round');
 
   // Test: blocked approval (reviewer says APPROVED but blockers remain)
   console.log('\n--- blocked approval ---');
@@ -220,6 +258,70 @@ const planPath = setup();
   fs.writeFileSync(badResp, JSON.stringify({ verdict: 'MAYBE', prior_issues: 'nope', new_issues: [], summary: 123 }));
   const r11 = run(`parse-round --workspace ${wsDir3} --round 3 --response ${badResp}`, { expectFail: true });
   assert(!r11.ok, 'invalid schema rejected');
+
+  // Test: force-approve with --ci-force in non-TTY mode (no blockers → clean finalize first)
+  console.log('\n--- force-approve: --ci-force non-TTY ---');
+  const outDir4 = path.join(tmpDir, 'reviews4');
+  const r12 = run(`init --plan ${planPath} --reviewer-model openai/codex --planner-model anthropic/sonnet --out ${outDir4}`);
+  const wsDir4 = r12.stdout;
+
+  const blockResp4 = path.join(tmpDir, 'block-resp4.json');
+  fs.writeFileSync(blockResp4, JSON.stringify({
+    verdict: 'REVISE',
+    prior_issues: [],
+    new_issues: [{ severity: 'CRITICAL', location: 'Core', problem: 'Unresolved fatal issue in architecture', fix: 'Redesign component' }],
+    summary: '1 critical',
+  }));
+  run(`parse-round --workspace ${wsDir4} --round 1 --response ${blockResp4}`, { allowExit1: true });
+
+  // Now force-approve with --ci-force (simulates non-TTY CI environment)
+  const r13 = run(
+    `finalize --workspace ${wsDir4} --override-reason "Emergency deadline approved by team" --ci-force`
+  );
+  const ciForceOutput = JSON.parse(r13.stdout);
+  assert(ciForceOutput.verdict === 'FORCE_APPROVED', '--ci-force produces FORCE_APPROVED verdict');
+  assert(ciForceOutput.forceApproved === true, 'forceApproved flag is true');
+
+  const summary4 = JSON.parse(fs.readFileSync(path.join(wsDir4, 'summary.json'), 'utf8'));
+  assert(summary4.force_approve_log !== null, 'force_approve_log written to summary.json');
+  assert(summary4.force_approve_log.ci_force === true, 'ci_force flag recorded in audit log');
+  assert(summary4.force_approve_log.reason === 'Emergency deadline approved by team', 'override reason recorded');
+
+  // Test: --ci-force without --override-reason should fail
+  console.log('\n--- force-approve: --ci-force requires --override-reason ---');
+  const outDir5 = path.join(tmpDir, 'reviews5');
+  const r14 = run(`init --plan ${planPath} --reviewer-model openai/codex --planner-model anthropic/sonnet --out ${outDir5}`);
+  const wsDir5 = r14.stdout;
+
+  const blockResp5 = path.join(tmpDir, 'block-resp5.json');
+  fs.writeFileSync(blockResp5, JSON.stringify({
+    verdict: 'REVISE',
+    prior_issues: [],
+    new_issues: [{ severity: 'HIGH', location: 'DB', problem: 'Missing index on foreign key', fix: 'Add index' }],
+    summary: '1 high',
+  }));
+  run(`parse-round --workspace ${wsDir5} --round 1 --response ${blockResp5}`, { allowExit1: true });
+
+  // --ci-force without --override-reason — should fail because no override-reason means die() with no blockers check
+  // Actually the check is: if blockers > 0 and no overrideReason, die. So this should fail.
+  const r15 = run(`finalize --workspace ${wsDir5} --ci-force`, { expectFail: true });
+  assert(!r15.ok, '--ci-force without --override-reason fails when blockers exist');
+  assert(r15.code === 2, 'exits with code 2 for missing override-reason');
+
+  // Test: unknown model family warnings
+  console.log('\n--- unknown model family handling ---');
+  // Both unknown: should warn but allow
+  const outDirUK = path.join(tmpDir, 'reviews-unknown');
+  const rUK = run(`init --plan ${planPath} --reviewer-model custom/unknown-model-xyz --planner-model custom2/another-unknown --out ${outDirUK}`);
+  assert(rUK.ok, 'both-unknown init exits 0 (warn but allow)');
+  // The workspace should still be created
+  assert(fs.existsSync(rUK.stdout), 'workspace created for both-unknown models');
+
+  // One unknown, one known: should warn but allow
+  const outDirUK2 = path.join(tmpDir, 'reviews-unknown2');
+  const rUK2 = run(`init --plan ${planPath} --reviewer-model custom/unknown-model-xyz --planner-model anthropic/sonnet --out ${outDirUK2}`);
+  assert(rUK2.ok, 'one-unknown one-known init exits 0 (warn but allow)');
+  assert(fs.existsSync(rUK2.stdout), 'workspace created for one-unknown model');
 }
 
 cleanup();

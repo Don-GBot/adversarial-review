@@ -1,8 +1,30 @@
 {
   "name": "cross-model-review",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Adversarial plan review using two different AI models",
-  "keywords": ["code-review", "multi-model", "adversarial", "planning", "quality"],
+  "keywords": [
+    "code-review",
+    "multi-model",
+    "adversarial",
+    "planning",
+    "quality",
+    "llm-evaluation",
+    "preflight-gate",
+    "ai-safety",
+    "architecture-review",
+    "openclaw-skill"
+  ],
   "author": "Don-GBot",
-  "license": "MIT"
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Don-GBot/adversarial-review"
+  },
+  "homepage": "https://github.com/Don-GBot/adversarial-review#readme",
+  "bugs": {
+    "url": "https://github.com/Don-GBot/adversarial-review/issues"
+  }
 }
