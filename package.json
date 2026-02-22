@@ -1,6 +1,6 @@
 {
   "name": "cross-model-review",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "Adversarial plan review using two different AI models",
   "keywords": [
     "code-review",

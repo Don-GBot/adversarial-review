@@ -308,6 +308,120 @@ const planPath = setup();
   assert(!r15.ok, '--ci-force without --override-reason fails when blockers exist');
   assert(r15.code === 2, 'exits with code 2 for missing override-reason');
 
+  // Test: rubric scoring
+  console.log('\n--- rubric scoring ---');
+
+  // Create a fresh workspace for rubric tests
+  const outDirRubric = path.join(tmpDir, 'reviews-rubric');
+  const rRubricInit = run(`init --plan ${planPath} --reviewer-model openai/gpt-4 --planner-model anthropic/sonnet --out ${outDirRubric}`);
+  const wsRubric = rRubricInit.stdout;
+
+  // Round 1: response with full rubric
+  const rubricResponse = JSON.stringify({
+    verdict: 'APPROVED',
+    rubric: {
+      security:        { score: 4, rationale: 'Auth properly implemented' },
+      data_integrity:  { score: 5, rationale: 'Schema is consistent' },
+      concurrency:     { score: null, rationale: 'Not applicable to this plan' },
+      error_handling:  { score: 3, rationale: 'Some timeout handling missing' },
+      scalability:     { score: 4, rationale: 'No unbounded operations' },
+      completeness:    { score: 4, rationale: 'Edge cases covered' },
+      maintainability: { score: 5, rationale: 'Clean code organization' },
+    },
+    prior_issues: [],
+    new_issues: [],
+    summary: 'Plan looks solid with minor error handling gaps.',
+  });
+  const rubricRespPath = path.join(tmpDir, 'rubric-response.json');
+  fs.writeFileSync(rubricRespPath, rubricResponse);
+
+  const rRubric1 = run(`parse-round --workspace "${wsRubric}" --round 1 --response "${rubricRespPath}"`);
+  assert(rRubric1.ok, 'rubric response parsed successfully');
+
+  const rubricOutput = JSON.parse(rRubric1.stdout);
+  assert(rubricOutput.rubric !== null, 'rubric present in output');
+  assert(rubricOutput.rubric.average !== undefined, 'rubric average calculated');
+  assert(rubricOutput.rubric.scored === 6, 'rubric scored 6 non-null dimensions');
+  assert(rubricOutput.rubric.average > 4.0, 'rubric average > 4.0 for good scores');
+  assert(rubricOutput.rubric.dimensions.security.score === 4, 'security score preserved');
+  assert(rubricOutput.rubric.dimensions.concurrency.score === null, 'null dimension preserved');
+
+  // Test rubric in round output file
+  const roundOutFile = path.join(wsRubric, 'round-1-output.json');
+  const roundOutData = JSON.parse(fs.readFileSync(roundOutFile, 'utf8'));
+  assert(roundOutData.rubric !== null, 'rubric saved to round output file');
+  assert(roundOutData.rubric._average > 4.0, 'rubric average in round output');
+  assert(roundOutData.rubricWarnings.length === 0, 'no rubric warnings for good scores');
+
+  // Finalize and check rubric in summary
+  const rRubricFin = run(`finalize --workspace "${wsRubric}"`);
+  assert(rRubricFin.ok, 'finalize with rubric succeeds');
+  const summaryRubric = JSON.parse(fs.readFileSync(path.join(wsRubric, 'summary.json'), 'utf8'));
+  assert(summaryRubric.rubric !== null, 'rubric in summary.json');
+  assert(summaryRubric.rubric.average > 4.0, 'rubric average in summary');
+
+  // Test: rubric with low scores triggers warnings
+  console.log('\n--- rubric low score warnings ---');
+  const outDirRubricLow = path.join(tmpDir, 'reviews-rubric-low');
+  const rRubricLowInit = run(`init --plan ${planPath} --reviewer-model openai/gpt-4 --planner-model anthropic/sonnet --out ${outDirRubricLow}`);
+  const wsRubricLow = rRubricLowInit.stdout;
+
+  const lowRubricResponse = JSON.stringify({
+    verdict: 'REVISE',
+    rubric: {
+      security:        { score: 1, rationale: 'Major auth vulnerability' },
+      data_integrity:  { score: 2, rationale: 'Schema inconsistencies' },
+      concurrency:     { score: null, rationale: 'N/A' },
+      error_handling:  { score: 1, rationale: 'No error handling at all' },
+      scalability:     { score: 3, rationale: 'OK for now' },
+      completeness:    { score: 2, rationale: 'Missing edge cases' },
+      maintainability: { score: 3, rationale: 'Acceptable' },
+    },
+    prior_issues: [],
+    new_issues: [
+      { severity: 'CRITICAL', location: 'Auth', problem: 'No auth check', fix: 'Add auth middleware' },
+    ],
+    summary: 'Significant security and error handling issues.',
+  });
+  const lowRubricRespPath = path.join(tmpDir, 'low-rubric-response.json');
+  fs.writeFileSync(lowRubricRespPath, lowRubricResponse);
+
+  const rRubricLow1 = run(`parse-round --workspace "${wsRubricLow}" --round 1 --response "${lowRubricRespPath}"`, { allowExit1: true });
+  assert(rRubricLow1.ok, 'low rubric response parsed');
+
+  const lowRubricOutput = JSON.parse(rRubricLow1.stdout);
+  assert(lowRubricOutput.rubric.warnings.length > 0, 'low scores generate rubric warnings');
+  assert(lowRubricOutput.rubric.warnings.some(w => w.includes('security')), 'security warning present');
+  assert(lowRubricOutput.rubric.warnings.some(w => w.includes('error_handling')), 'error_handling warning present');
+  assert(lowRubricOutput.rubric.average < 3.0, 'low average detected');
+
+  // Test: response without rubric (backward compat)
+  console.log('\n--- rubric backward compatibility ---');
+  const outDirNoRubric = path.join(tmpDir, 'reviews-norubric');
+  const rNoRubricInit = run(`init --plan ${planPath} --reviewer-model openai/gpt-4 --planner-model anthropic/sonnet --out ${outDirNoRubric}`);
+  const wsNoRubric = rNoRubricInit.stdout;
+
+  const noRubricResponse = JSON.stringify({
+    verdict: 'APPROVED',
+    prior_issues: [],
+    new_issues: [],
+    summary: 'Looks good.',
+  });
+  const noRubricRespPath = path.join(tmpDir, 'no-rubric-response.json');
+  fs.writeFileSync(noRubricRespPath, noRubricResponse);
+
+  const rNoRubric1 = run(`parse-round --workspace "${wsNoRubric}" --round 1 --response "${noRubricRespPath}"`);
+  assert(rNoRubric1.ok, 'response without rubric still parses (backward compat)');
+  const noRubricOutput = JSON.parse(rNoRubric1.stdout);
+  assert(noRubricOutput.rubric === null, 'rubric is null when not provided');
+
+  // Test: rubric in status
+  console.log('\n--- rubric in status ---');
+  const rRubricStatus = run(`status --workspace "${wsRubric}"`);
+  const statusOutput = JSON.parse(rRubricStatus.stdout);
+  assert(statusOutput.rubric !== null, 'rubric present in status output');
+  assert(statusOutput.rubric.average > 4.0, 'rubric average in status');
+
   // Test: unknown model family warnings
   console.log('\n--- unknown model family handling ---');
   // Both unknown: should warn but allow

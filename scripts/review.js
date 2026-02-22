@@ -163,6 +163,10 @@ function nextIssueId(issues) {
 const VALID_VERDICTS   = new Set(['APPROVED', 'REVISE']);
 const VALID_SEVERITIES = new Set(['CRITICAL', 'HIGH', 'MEDIUM', 'LOW']);
 const VALID_STATUSES   = new Set(['resolved', 'still-open', 'regressed', 'not-applicable']);
+const RUBRIC_DIMENSIONS = [
+  'security', 'data_integrity', 'concurrency',
+  'error_handling', 'scalability', 'completeness', 'maintainability',
+];
 
 function validateReviewResponse(obj) {
   const errors = [];
@@ -190,6 +194,40 @@ function validateReviewResponse(obj) {
   if (typeof obj.summary !== 'string') {
     errors.push('summary must be a string');
   }
+
+  // Rubric validation (optional for backward compat, but validated if present)
+  if (obj.rubric !== undefined && obj.rubric !== null) {
+    if (typeof obj.rubric !== 'object' || Array.isArray(obj.rubric)) {
+      errors.push('rubric must be an object');
+    } else {
+      let scoredCount = 0;
+      for (const dim of RUBRIC_DIMENSIONS) {
+        const entry = obj.rubric[dim];
+        if (entry === undefined) {
+          errors.push(`rubric.${dim} is missing`);
+          continue;
+        }
+        if (typeof entry !== 'object' || entry === null) {
+          errors.push(`rubric.${dim} must be an object with score and rationale`);
+          continue;
+        }
+        if (entry.score !== null) {
+          if (typeof entry.score !== 'number' || entry.score < 0 || entry.score > 5 || !Number.isInteger(entry.score)) {
+            errors.push(`rubric.${dim}.score must be an integer 0-5 or null, got: ${entry.score}`);
+          } else {
+            scoredCount++;
+          }
+        }
+        if (typeof entry.rationale !== 'string' || entry.rationale.length === 0) {
+          errors.push(`rubric.${dim}.rationale must be a non-empty string`);
+        }
+      }
+      if (scoredCount < 3) {
+        errors.push(`rubric must have at least 3 scored (non-null) dimensions, got: ${scoredCount}`);
+      }
+    }
+  }
+
   return errors;
 }
 
@@ -420,6 +458,37 @@ function cmdParseRound(args) {
 
   saveIssues(wsDir, issues);
 
+  // ---- Rubric scoring ----
+  let rubric = null;
+  let rubricWarnings = [];
+  if (parsed.rubric && typeof parsed.rubric === 'object') {
+    rubric = {};
+    const scores = [];
+    for (const dim of RUBRIC_DIMENSIONS) {
+      const entry = parsed.rubric[dim];
+      if (entry && typeof entry === 'object') {
+        rubric[dim] = {
+          score: entry.score !== undefined ? entry.score : null,
+          rationale: entry.rationale || '',
+        };
+        if (entry.score !== null && typeof entry.score === 'number') {
+          scores.push(entry.score);
+          if (entry.score < 2) {
+            rubricWarnings.push(`${dim} scored ${entry.score}/5 — critical weakness`);
+          }
+        }
+      }
+    }
+    if (scores.length > 0) {
+      const avg = scores.reduce((a, b) => a + b, 0) / scores.length;
+      rubric._average = Math.round(avg * 100) / 100;
+      rubric._scored_dimensions = scores.length;
+      if (avg < 3.0) {
+        rubricWarnings.push(`Average rubric score ${rubric._average}/5 is below threshold (3.0)`);
+      }
+    }
+  }
+
   // ---- Approval gate ----
   const blockers   = getOpenBlockers(issues);
   let finalVerdict = parsed.verdict;
@@ -436,6 +505,8 @@ function cmdParseRound(args) {
     verdict:       finalVerdict,
     reviewVerdict: parsed.verdict,
     summary:       parsed.summary,
+    rubric:        rubric,
+    rubricWarnings,
     newIssues:     assignedNewIssues.map(i => i.id),
     dedupWarnings,
     blockers:      blockers.map(i => i.id),
@@ -451,10 +522,14 @@ function cmdParseRound(args) {
   // ---- Append to changelog ----
   const openCount     = issues.filter(i => i.status === 'open' || i.status === 'still-open').length;
   const resolvedCount = issues.filter(i => i.status === 'resolved').length;
+  const rubricLine = rubric && rubric._average !== undefined
+    ? `Rubric: avg ${rubric._average}/5 (${rubric._scored_dimensions} dimensions)${rubricWarnings.length ? ' ⚠️ ' + rubricWarnings.join('; ') : ''}`
+    : 'Rubric: not provided';
   const changeEntry   = [
     `\n## Round ${round} — ${new Date().toISOString()}`,
     `Verdict: **${finalVerdict}**`,
     `Summary: ${parsed.summary}`,
+    rubricLine,
     `New issues: ${assignedNewIssues.length} (${assignedNewIssues.map(i => `${i.id} ${i.severity}`).join(', ') || 'none'})`,
     `Dedup warnings: ${dedupWarnings.length}`,
     `Open blockers: ${blockers.length}`,
@@ -467,6 +542,14 @@ function cmdParseRound(args) {
   info(JSON.stringify({
     verdict: finalVerdict,
     round,
+    rubric: rubric ? {
+      average: rubric._average,
+      scored: rubric._scored_dimensions,
+      warnings: rubricWarnings,
+      dimensions: Object.fromEntries(
+        RUBRIC_DIMENSIONS.map(d => [d, rubric[d] || null])
+      ),
+    } : null,
     newIssues: assignedNewIssues.length,
     dedupWarnings: dedupWarnings.length,
     blockers: blockers.length,
@@ -578,6 +661,19 @@ function cmdFinalize(args) {
     if (key in bySeverity) bySeverity[key]++;
   }
 
+  // ---- Aggregate rubric scores across rounds ----
+  let latestRubric = null;
+  for (let r = meta.currentRound; r >= 1; r--) {
+    const roundOutPath = path.join(wsDir, `round-${r}-output.json`);
+    if (fs.existsSync(roundOutPath)) {
+      const roundOut = readJson(roundOutPath);
+      if (roundOut.rubric) {
+        latestRubric = roundOut.rubric;
+        break;
+      }
+    }
+  }
+
   const isTTY = process.stdin.isTTY && process.stdout.isTTY;
   const summary = {
     rounds:            meta.currentRound,
@@ -587,6 +683,13 @@ function cmdFinalize(args) {
     issuesBySeverity:  bySeverity,
     issuesResolved:    totalResolved,
     issuesUnresolved:  totalFound - totalResolved,
+    rubric:            latestRubric ? {
+      average:    latestRubric._average,
+      scored:     latestRubric._scored_dimensions,
+      dimensions: Object.fromEntries(
+        RUBRIC_DIMENSIONS.map(d => [d, latestRubric[d] || null])
+      ),
+    } : null,
     finalVerdict:      blockers.length > 0 && forceApproveLog ? 'FORCE_APPROVED' : 'APPROVED',
     completedAt:       new Date().toISOString(),
     force_approve_log: forceApproveLog,
@@ -638,6 +741,19 @@ function cmdStatus(args) {
   const resolved = issues.filter(i => ['resolved', 'not-applicable', 'force-approved'].includes(i.status));
   const blockers = getOpenBlockers(issues);
 
+  // Fetch latest rubric from most recent round output
+  let latestRubric = null;
+  for (let r = meta.currentRound; r >= 1; r--) {
+    const roundOutPath = path.join(wsDir, `round-${r}-output.json`);
+    if (fs.existsSync(roundOutPath)) {
+      const roundOut = readJson(roundOutPath);
+      if (roundOut.rubric) {
+        latestRubric = roundOut.rubric;
+        break;
+      }
+    }
+  }
+
   const out = {
     workspace:      wsDir,
     verdict:        meta.verdict,
@@ -647,6 +763,13 @@ function cmdStatus(args) {
     totalIssues:    issues.length,
     openIssues:     open.length,
     resolvedIssues: resolved.length,
+    rubric:         latestRubric ? {
+      average:    latestRubric._average,
+      scored:     latestRubric._scored_dimensions,
+      dimensions: Object.fromEntries(
+        RUBRIC_DIMENSIONS.map(d => [d, latestRubric[d] || null])
+      ),
+    } : null,
     blockers:       blockers.map(i => ({ id: i.id, severity: i.severity, problem: i.problem })),
     allIssues:      issues.map(i => ({
       id:       i.id,

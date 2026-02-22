@@ -8,7 +8,7 @@ description: Adversarial plan review using two different AI models. Planner writ
 ## Metadata
 ```yaml
 name: cross-model-review
-version: 1.0.1
+version: 1.1.0
 description: >
   Adversarial plan review using two different AI models. The agent (planner)
   writes/revises, a spawned reviewer challenges, they iterate until APPROVED.
@@ -144,6 +144,8 @@ node /home/ubuntu/clawd/skills/cross-model-review/scripts/review.js finalize \
 Then: present the final plan summary to the user. Show:
 - How many rounds it took
 - Total issues found / resolved
+- Rubric scores (per-dimension + average) if provided by reviewer
+- Any rubric warnings (dimensions < 2 or average < 3.0)
 - Location of `plan-final.md` and `summary.json`
 - Any dedup warnings that were noted
 Done — exit the loop.

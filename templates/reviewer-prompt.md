@@ -39,6 +39,15 @@ Output ONLY the following JSON object. No text before it. No text after it. No m
 
 {
   "verdict": "APPROVED" | "REVISE",
+  "rubric": {
+    "security":        { "score": 0-5 | null, "rationale": "one-line justification" },
+    "data_integrity":  { "score": 0-5 | null, "rationale": "one-line justification" },
+    "concurrency":     { "score": 0-5 | null, "rationale": "one-line justification" },
+    "error_handling":  { "score": 0-5 | null, "rationale": "one-line justification" },
+    "scalability":     { "score": 0-5 | null, "rationale": "one-line justification" },
+    "completeness":    { "score": 0-5 | null, "rationale": "one-line justification" },
+    "maintainability": { "score": 0-5 | null, "rationale": "one-line justification" }
+  },
   "prior_issues": [
     { "id": "ISS-XXX", "status": "resolved|still-open|regressed|not-applicable", "evidence": "brief explanation" }
   ],
@@ -53,3 +62,6 @@ Rules:
 - prior_issues array must include ALL issues from the prior issues list, even if not-applicable
 - new_issues can be empty array [] if no new issues found
 - Every new_issue must have all four fields: severity, location, problem, fix
+- rubric: score each dimension 0 (catastrophic) to 5 (excellent), or null if the dimension does not apply to this plan
+- rubric: every dimension must have both score and rationale fields
+- rubric: at least 3 dimensions must have a non-null score
