@@ -65,6 +65,13 @@ function writeJson(filePath, data) {
   fs.writeFileSync(filePath, JSON.stringify(data, null, 2) + '\n', 'utf8');
 }
 
+/** Atomic JSON write: write to .tmp then rename (POSIX atomic). */
+function writeJsonAtomic(filePath, data) {
+  const tmp = filePath + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n', 'utf8');
+  fs.renameSync(tmp, filePath);
+}
+
 function readFile(filePath) {
   try {
     return fs.readFileSync(filePath, 'utf8');
@@ -376,7 +383,7 @@ function cmdInit(args) {
     needsRevision:  false,
     wsDir,
   };
-  writeJson(path.join(wsDir, 'meta.json'), meta);
+  writeJsonAtomic(path.join(wsDir, 'meta.json'), meta);
 
   // Initialize issue tracker and changelog
   writeJson(path.join(wsDir, 'issues.json'), []);
@@ -552,7 +559,7 @@ function cmdParseRound(args) {
   meta.currentRound = round;
   meta.verdict = finalVerdict;
   meta.needsRevision = (finalVerdict === 'REVISE');
-  writeJson(path.join(wsDir, 'meta.json'), meta);
+  writeJsonAtomic(path.join(wsDir, 'meta.json'), meta);
 
   // ---- Append to changelog ----
   const openCount     = issues.filter(i => i.status === 'open' || i.status === 'still-open').length;
@@ -745,7 +752,7 @@ function cmdFinalize(args) {
   // Update meta
   meta.verdict = summary.finalVerdict;
   meta.completedAt = summary.completedAt;
-  writeJson(path.join(wsDir, 'meta.json'), meta);
+  writeJsonAtomic(path.join(wsDir, 'meta.json'), meta);
 
   info(JSON.stringify({
     verdict:        summary.finalVerdict,
@@ -825,10 +832,32 @@ function cmdStatus(args) {
 function cmdNextStep(args) {
   const wsDir = args['workspace'];
   if (!wsDir) die('--workspace <dir> is required');
-  if (!fs.existsSync(wsDir)) die(`Workspace not found: ${wsDir}`);
 
-  const meta   = getWorkspaceMeta(wsDir);
+  // Error states returned as JSON instead of dying (orchestrator needs machine-readable errors)
+  if (!fs.existsSync(wsDir)) {
+    info(JSON.stringify({ action: 'error', reason: `workspace not found: ${wsDir}` }));
+    return 2;
+  }
+
+  const metaPath = path.join(wsDir, 'meta.json');
+  if (!fs.existsSync(metaPath)) {
+    info(JSON.stringify({ action: 'error', reason: 'meta.json missing or corrupt' }));
+    return 2;
+  }
+
+  let meta;
+  try { meta = readJson(metaPath); } catch (e) {
+    info(JSON.stringify({ action: 'error', reason: `meta.json parse error: ${e.message}` }));
+    return 2;
+  }
+
   const issues = getIssues(wsDir);
+
+  // Sanity: needsRevision but no rounds completed
+  if (meta.needsRevision && meta.currentRound === 0) {
+    info(JSON.stringify({ action: 'error', reason: 'needsRevision set but no rounds completed' }));
+    return 2;
+  }
 
   // Already finalized?
   if (meta.verdict === 'APPROVED' || meta.verdict === 'FORCE_APPROVED') {
@@ -980,13 +1009,22 @@ function cmdSavePlan(args) {
   if (!fs.existsSync(planPath)) die(`Plan file not found: ${planPath}`);
 
   const planContent = readFile(planPath);
+
+  // Validate: reject empty/garbage output
+  if (planContent.length < 50) {
+    die(`Plan file too small (${planContent.length} bytes) — likely empty or failed output. Min 50 bytes.`, 1);
+  }
+  if (!/^#\s/m.test(planContent)) {
+    die('Plan file contains no markdown heading (# ...). Likely not a valid plan.', 1);
+  }
+
   const destPath = path.join(wsDir, `plan-v${version}.md`);
   fs.writeFileSync(destPath, planContent, 'utf8');
 
   // Update meta: revision done, ready for next review
   const meta = getWorkspaceMeta(wsDir);
   meta.needsRevision = false;
-  writeJson(path.join(wsDir, 'meta.json'), meta);
+  writeJsonAtomic(path.join(wsDir, 'meta.json'), meta);
 
   // Append to changelog
   const entry = `\n## Plan v${version} — ${new Date().toISOString()}\nRevised plan saved (${planContent.length} chars)\n`;
