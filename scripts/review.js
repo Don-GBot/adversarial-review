@@ -7,6 +7,8 @@
  *   parse-round  Parse reviewer response, update issue tracker
  *   finalize     Generate plan-final.md, changelog.md, summary.json
  *   status       Print current workspace state
+ *   next-step    Get next action for autonomous loop (alternating mode)
+ *   save-plan    Save a revised plan from writer sub-agent
  *
  * Exit codes: 0=approved/ok  1=revise/unapproved  2=error
  */
@@ -289,32 +291,57 @@ function getOpenBlockers(issues) {
 // COMMAND: init
 // ---------------------------------------------------------------------------
 function cmdInit(args) {
+  const mode          = args['mode'] || 'static';
   const planPath      = args['plan'];
-  const reviewerModel = args['reviewer-model'];
-  const plannerModel  = args['planner-model'];
   const outBase       = args['out'] || path.join(process.cwd(), 'tasks/reviews');
-  const maxRounds     = parseInt(args['max-rounds'] || '5', 10);
+  const maxRounds     = parseInt(args['max-rounds'] || (mode === 'alternating' ? '8' : '5'), 10);
   const tokenBudget   = parseInt(args['token-budget'] || '8000', 10);
+  const projectCtx    = args['project-context'] || '';
 
-  if (!planPath)      die('--plan <file> is required');
-  if (!reviewerModel) die('--reviewer-model <model> is required');
-  if (!plannerModel)  die('--planner-model <model> is required');
+  if (!planPath) die('--plan <file> is required');
+  if (!['static', 'alternating'].includes(mode)) die('--mode must be "static" or "alternating"');
 
   if (isNaN(maxRounds) || maxRounds < 1)   die('--max-rounds must be a positive integer');
   if (isNaN(tokenBudget) || tokenBudget < 1) die('--token-budget must be a positive integer');
-
   if (!fs.existsSync(planPath)) die(`Plan file not found: ${planPath}`);
 
-  const rFamily = detectFamily(reviewerModel);
-  const pFamily = detectFamily(plannerModel);
+  let reviewerModel, plannerModel, rFamily, pFamily, modelA, modelB, familyA, familyB;
+
+  if (mode === 'alternating') {
+    modelA = args['model-a'];
+    modelB = args['model-b'];
+    if (!modelA) die('--model-a <model> is required for alternating mode');
+    if (!modelB) die('--model-b <model> is required for alternating mode');
+    familyA = detectFamily(modelA);
+    familyB = detectFamily(modelB);
+    if (familyA !== 'unknown' && familyB !== 'unknown' && familyA === familyB) {
+      die(`Model A and Model B are from the same provider family (${familyA}). Cross-provider review required.`);
+    }
+    // For backward compat, set reviewer/planner to modelB/modelA
+    reviewerModel = modelB;
+    plannerModel  = modelA;
+    rFamily = familyB;
+    pFamily = familyA;
+  } else {
+    reviewerModel = args['reviewer-model'];
+    plannerModel  = args['planner-model'];
+    if (!reviewerModel) die('--reviewer-model <model> is required');
+    if (!plannerModel)  die('--planner-model <model> is required');
+    rFamily = detectFamily(reviewerModel);
+    pFamily = detectFamily(plannerModel);
+    modelA = plannerModel;
+    modelB = reviewerModel;
+    familyA = pFamily;
+    familyB = rFamily;
+  }
 
   if (rFamily === 'unknown' && pFamily === 'unknown') {
-    console.warn(`WARNING: Both reviewer (${reviewerModel}) and planner (${plannerModel}) resolved to unknown provider family. Cannot verify cross-provider constraint. Proceeding anyway.`);
+    console.warn(`WARNING: Both models resolved to unknown provider family. Cannot verify cross-provider constraint. Proceeding anyway.`);
   } else if (rFamily === 'unknown') {
-    console.warn(`WARNING: Reviewer model (${reviewerModel}) resolved to unknown provider family. Cannot verify it differs from planner (${pFamily}). Proceeding anyway.`);
+    console.warn(`WARNING: Reviewer model resolved to unknown provider family. Proceeding anyway.`);
   } else if (pFamily === 'unknown') {
-    console.warn(`WARNING: Planner model (${plannerModel}) resolved to unknown provider family. Cannot verify it differs from reviewer (${rFamily}). Proceeding anyway.`);
-  } else if (rFamily === pFamily) {
+    console.warn(`WARNING: Planner model resolved to unknown provider family. Proceeding anyway.`);
+  } else if (mode === 'static' && rFamily === pFamily) {
     die(`Reviewer and planner are from the same provider family (${rFamily}). Cross-provider review required.`);
   }
 
@@ -332,21 +359,28 @@ function cmdInit(args) {
   // Write meta
   const meta = {
     created:        new Date().toISOString(),
+    mode,
+    modelA,
+    modelB,
+    familyA,
+    familyB,
     reviewerModel,
     plannerModel,
     reviewerFamily: rFamily,
     plannerFamily:  pFamily,
     maxRounds,
     tokenBudget,
+    projectContext: projectCtx,
     currentRound:   0,
     verdict:        'PENDING',
+    needsRevision:  false,
     wsDir,
   };
   writeJson(path.join(wsDir, 'meta.json'), meta);
 
   // Initialize issue tracker and changelog
   writeJson(path.join(wsDir, 'issues.json'), []);
-  fs.writeFileSync(path.join(wsDir, 'changelog.md'), `# Review Changelog\n\nWorkspace: ${wsDir}\nStarted: ${meta.created}\nReviewer: ${reviewerModel}\nPlanner: ${plannerModel}\n\n`, 'utf8');
+  fs.writeFileSync(path.join(wsDir, 'changelog.md'), `# Review Changelog\n\nWorkspace: ${wsDir}\nStarted: ${meta.created}\nMode: ${mode}\nModel A: ${modelA}\nModel B: ${modelB}\n\n`, 'utf8');
 
   info(wsDir);
   return 0;
@@ -517,6 +551,7 @@ function cmdParseRound(args) {
   const meta = getWorkspaceMeta(wsDir);
   meta.currentRound = round;
   meta.verdict = finalVerdict;
+  meta.needsRevision = (finalVerdict === 'REVISE');
   writeJson(path.join(wsDir, 'meta.json'), meta);
 
   // ---- Append to changelog ----
@@ -785,6 +820,183 @@ function cmdStatus(args) {
 }
 
 // ---------------------------------------------------------------------------
+// COMMAND: next-step (alternating mode orchestrator)
+// ---------------------------------------------------------------------------
+function cmdNextStep(args) {
+  const wsDir = args['workspace'];
+  if (!wsDir) die('--workspace <dir> is required');
+  if (!fs.existsSync(wsDir)) die(`Workspace not found: ${wsDir}`);
+
+  const meta   = getWorkspaceMeta(wsDir);
+  const issues = getIssues(wsDir);
+
+  // Already finalized?
+  if (meta.verdict === 'APPROVED' || meta.verdict === 'FORCE_APPROVED') {
+    info(JSON.stringify({ action: 'done', reason: 'already approved' }));
+    return 0;
+  }
+
+  const mode = meta.mode || 'static';
+  const round = meta.currentRound;
+  const templateDir = path.join(__dirname, '..', 'templates');
+
+  // --- Determine state ---
+  // needsRevision: last parse-round returned REVISE, writer hasn't produced next plan yet
+  if (meta.needsRevision) {
+    // Writer needs to produce plan-v(round+1).md
+    const nextPlanVersion = round + 1;
+    const nextPlanPath = path.join(wsDir, `plan-v${nextPlanVersion}.md`);
+
+    // Who writes? In alternating: the reviewer of the last round (they implement their own fixes)
+    // Round N reviewer: odd=B, even=A. So the writer for revision after round N is:
+    let writerModel;
+    if (mode === 'alternating') {
+      writerModel = (round % 2 === 1) ? meta.modelB : meta.modelA;
+    } else {
+      writerModel = meta.plannerModel;  // static mode: planner always writes
+    }
+
+    // Build writer prompt
+    const currentPlanVersion = getLatestPlanVersion(wsDir);
+    const planContent = readFile(path.join(wsDir, currentPlanVersion));
+
+    // Get last round's review summary
+    const roundOutPath = path.join(wsDir, `round-${round}-output.json`);
+    let reviewSummary = 'No review summary available.';
+    if (fs.existsSync(roundOutPath)) {
+      const roundOut = readJson(roundOutPath);
+      reviewSummary = roundOut.summary || reviewSummary;
+    }
+
+    // Get open issues
+    const openIssues = issues
+      .filter(i => ['open', 'still-open', 'regressed'].includes(i.status))
+      .map(i => `- [${i.severity}] ${i.id}: ${i.location} — ${i.problem}\n  Fix: ${i.fix}`)
+      .join('\n');
+
+    // Load writer prompt template
+    const writerTemplatePath = path.join(templateDir, 'writer-prompt.md');
+    let writerPrompt;
+    if (fs.existsSync(writerTemplatePath)) {
+      writerPrompt = readFile(writerTemplatePath)
+        .replace('{plan_content}', planContent)
+        .replace('{review_summary}', reviewSummary)
+        .replace('{open_issues}', openIssues || 'No open issues.');
+    } else {
+      writerPrompt = `Rewrite this plan addressing the review feedback.\n\nPlan:\n${planContent}\n\nFeedback: ${reviewSummary}\n\nIssues:\n${openIssues}`;
+    }
+
+    info(JSON.stringify({
+      action:      'revise',
+      model:       writerModel,
+      round:       round,
+      planVersion: nextPlanVersion,
+      saveTo:      nextPlanPath,
+      prompt:      writerPrompt,
+    }));
+    return 0;
+  }
+
+  // Not pending revision — need to do a review
+  const nextRound = round + 1;
+
+  // Max rounds check
+  if (nextRound > meta.maxRounds) {
+    info(JSON.stringify({ action: 'max-rounds', reason: `reached max rounds (${meta.maxRounds})`, round }));
+    return 1;
+  }
+
+  // Who reviews?
+  let reviewerModel;
+  if (mode === 'alternating') {
+    // Odd rounds: B reviews. Even rounds: A reviews.
+    reviewerModel = (nextRound % 2 === 1) ? meta.modelB : meta.modelA;
+  } else {
+    reviewerModel = meta.reviewerModel;
+  }
+
+  // Build reviewer prompt
+  const currentPlanVersion = getLatestPlanVersion(wsDir);
+  const planContent = readFile(path.join(wsDir, currentPlanVersion));
+
+  // Choose template
+  const templateName = (mode === 'alternating') ? 'alternating-reviewer-prompt.md' : 'reviewer-prompt.md';
+  const templatePath = path.join(templateDir, templateName);
+  let reviewerPrompt;
+
+  const priorIssuesJson = (issues.length === 0)
+    ? '"First review — no prior issues"'
+    : JSON.stringify(issues.map(i => ({
+        id: i.id, severity: i.severity, location: i.location,
+        problem: i.problem, fix: i.fix, status: i.status, round_found: i.round_found,
+      })), null, 2);
+
+  if (fs.existsSync(templatePath)) {
+    reviewerPrompt = readFile(templatePath)
+      .replace('{plan_content}', planContent)
+      .replace('{round}', String(nextRound))
+      .replace('{prior_issues_json}', priorIssuesJson)
+      .replace('{codebase_context_or_"None provided"}', meta.projectContext || 'None provided')
+      .replace('{project_context}', meta.projectContext || 'None provided');
+  } else {
+    reviewerPrompt = `Review this plan (round ${nextRound}):\n\n${planContent}\n\nPrior issues: ${priorIssuesJson}`;
+  }
+
+  info(JSON.stringify({
+    action:      'review',
+    model:       reviewerModel,
+    round:       nextRound,
+    planVersion: currentPlanVersion,
+    prompt:      reviewerPrompt,
+  }));
+  return 0;
+}
+
+// Helper: find latest plan-vN.md in workspace
+function getLatestPlanVersion(wsDir) {
+  const planVersions = fs.readdirSync(wsDir)
+    .filter(f => /^plan-v\d+\.md$/.test(f))
+    .sort((a, b) => {
+      const na = parseInt(a.match(/(\d+)/)[1], 10);
+      const nb = parseInt(b.match(/(\d+)/)[1], 10);
+      return na - nb;
+    });
+  if (planVersions.length === 0) die('No plan versions found in workspace.');
+  return planVersions[planVersions.length - 1];
+}
+
+// ---------------------------------------------------------------------------
+// COMMAND: save-plan (save a revised plan from writer sub-agent)
+// ---------------------------------------------------------------------------
+function cmdSavePlan(args) {
+  const wsDir   = args['workspace'];
+  const planPath = args['plan'];
+  const version  = parseInt(args['version'], 10);
+
+  if (!wsDir)   die('--workspace <dir> is required');
+  if (!planPath) die('--plan <file> is required');
+  if (!version || isNaN(version)) die('--version <n> is required');
+  if (!fs.existsSync(wsDir))    die(`Workspace not found: ${wsDir}`);
+  if (!fs.existsSync(planPath)) die(`Plan file not found: ${planPath}`);
+
+  const planContent = readFile(planPath);
+  const destPath = path.join(wsDir, `plan-v${version}.md`);
+  fs.writeFileSync(destPath, planContent, 'utf8');
+
+  // Update meta: revision done, ready for next review
+  const meta = getWorkspaceMeta(wsDir);
+  meta.needsRevision = false;
+  writeJson(path.join(wsDir, 'meta.json'), meta);
+
+  // Append to changelog
+  const entry = `\n## Plan v${version} — ${new Date().toISOString()}\nRevised plan saved (${planContent.length} chars)\n`;
+  fs.appendFileSync(path.join(wsDir, 'changelog.md'), entry, 'utf8');
+
+  info(JSON.stringify({ saved: destPath, version, chars: planContent.length }));
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
 // Help
 // ---------------------------------------------------------------------------
 function printHelp() {
@@ -798,16 +1010,22 @@ Commands:
   parse-round    Parse a reviewer response, update issue tracker
   finalize       Generate plan-final.md, changelog.md, summary.json
   status         Print current workspace state
+  next-step      Get next action for autonomous loop (any mode)
+  save-plan      Save a revised plan version from writer output
 
 Global options:
   --help         Show this help
 
 init options:
   --plan <file>            Path to plan file (required)
-  --reviewer-model <m>     Reviewer model identifier (required)
-  --planner-model <m>      Planner model identifier (required)
+  --mode <m>               "static" (default) or "alternating"
+  --reviewer-model <m>     Reviewer model (static mode, required)
+  --planner-model <m>      Planner model (static mode, required)
+  --model-a <m>            Model A — writes first, reviews second (alternating mode)
+  --model-b <m>            Model B — reviews first, writes second (alternating mode)
+  --project-context <s>    Brief project context for reviewer calibration
   --out <dir>              Output base directory (default: tasks/reviews)
-  --max-rounds <n>         Maximum review rounds (default: 5)
+  --max-rounds <n>         Maximum rounds (default: 5 static, 8 alternating)
   --token-budget <n>       Token budget for codebase context (default: 8000)
 
 parse-round options:
@@ -822,6 +1040,14 @@ finalize options:
 
 status options:
   --workspace <dir>        Path to review workspace (required)
+
+next-step options:
+  --workspace <dir>        Path to review workspace (required)
+
+save-plan options:
+  --workspace <dir>        Path to review workspace (required)
+  --plan <file>            Path to revised plan file (required)
+  --version <n>            Plan version number (required, e.g. 2, 3, 4)
 
 Exit codes:
   0   Approved / OK
@@ -857,6 +1083,8 @@ function main() {
     case 'parse-round': exitCode = cmdParseRound(args); break;
     case 'finalize':    exitCode = cmdFinalize(args); break;
     case 'status':      exitCode = cmdStatus(args); break;
+    case 'next-step':   exitCode = cmdNextStep(args); break;
+    case 'save-plan':   exitCode = cmdSavePlan(args); break;
     default:
       console.error(`Unknown command: ${cmd}`);
       printHelp();
