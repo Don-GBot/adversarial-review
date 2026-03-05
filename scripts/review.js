@@ -381,6 +381,8 @@ function cmdInit(args) {
     currentRound:   0,
     verdict:        'PENDING',
     needsRevision:  false,
+    criteria:       null,         // Round 0: task-specific acceptance criteria (set by criteria-negotiate)
+    criteriaPhase:  'propose',    // 'propose' → 'challenge' → 'done'
     wsDir,
   };
   writeJsonAtomic(path.join(wsDir, 'meta.json'), meta);
@@ -869,6 +871,60 @@ function cmdNextStep(args) {
   const round = meta.currentRound;
   const templateDir = path.join(__dirname, '..', 'templates');
 
+  // --- Round 0: Criteria negotiation (if not yet done) ---
+  const criteriaPhase = meta.criteriaPhase || 'done';  // backward compat: old workspaces skip
+  if (criteriaPhase !== 'done' && round === 0) {
+    const currentPlanVersion = getLatestPlanVersion(wsDir);
+    const planContent = readFile(path.join(wsDir, currentPlanVersion));
+
+    if (criteriaPhase === 'propose') {
+      // Model A proposes criteria
+      const templatePath = path.join(templateDir, 'criteria-propose-prompt.md');
+      let prompt;
+      if (fs.existsSync(templatePath)) {
+        prompt = readFile(templatePath)
+          .replace('{plan_content}', planContent)
+          .replace('{project_context}', meta.projectContext || 'None provided');
+      } else {
+        prompt = `Propose 5 task-specific acceptance criteria for this plan:\n\n${planContent}`;
+      }
+      info(JSON.stringify({
+        action:    'criteria-propose',
+        model:     meta.modelA || meta.plannerModel,
+        prompt,
+        saveTo:    'use save-criteria --phase propose',
+      }));
+      return 0;
+    }
+
+    if (criteriaPhase === 'challenge') {
+      // Model B challenges/refines criteria
+      const proposedPath = path.join(wsDir, 'criteria-proposed.json');
+      if (!fs.existsSync(proposedPath)) {
+        info(JSON.stringify({ action: 'error', reason: 'criteria-proposed.json missing — run save-criteria --phase propose first' }));
+        return 2;
+      }
+      const proposed = readJson(proposedPath);
+      const templatePath = path.join(templateDir, 'criteria-challenge-prompt.md');
+      let prompt;
+      if (fs.existsSync(templatePath)) {
+        prompt = readFile(templatePath)
+          .replace('{plan_content}', planContent)
+          .replace('{project_context}', meta.projectContext || 'None provided')
+          .replace('{proposed_criteria_json}', JSON.stringify(proposed, null, 2));
+      } else {
+        prompt = `Challenge these proposed criteria:\n${JSON.stringify(proposed, null, 2)}\n\nPlan:\n${planContent}`;
+      }
+      info(JSON.stringify({
+        action:    'criteria-challenge',
+        model:     meta.modelB || meta.reviewerModel,
+        prompt,
+        saveTo:    'use save-criteria --phase challenge',
+      }));
+      return 0;
+    }
+  }
+
   // --- Determine state ---
   // needsRevision: last parse-round returned REVISE, writer hasn't produced next plan yet
   if (meta.needsRevision) {
@@ -960,15 +1016,25 @@ function cmdNextStep(args) {
         problem: i.problem, fix: i.fix, status: i.status, round_found: i.round_found,
       })), null, 2);
 
+  // Build criteria section for injection
+  let criteriaSection = '';
+  if (meta.criteria && Array.isArray(meta.criteria) && meta.criteria.length > 0) {
+    criteriaSection = '\n\n## Task-Specific Acceptance Criteria (agreed in Round 0)\n\n'
+      + 'In ADDITION to the standard rubric, evaluate the plan against these task-specific criteria.\n'
+      + 'For each criterion, note PASS or FAIL with brief evidence in your summary.\n\n'
+      + meta.criteria.map(c => `- **${c.id}**: ${c.description} (risk if missed: ${c.risk_if_missed})`).join('\n')
+      + '\n';
+  }
+
   if (fs.existsSync(templatePath)) {
     reviewerPrompt = readFile(templatePath)
       .replace('{plan_content}', planContent)
       .replace('{round}', String(nextRound))
       .replace('{prior_issues_json}', priorIssuesJson)
       .replace('{codebase_context_or_"None provided"}', meta.projectContext || 'None provided')
-      .replace('{project_context}', meta.projectContext || 'None provided');
+      .replace('{project_context}', (meta.projectContext || 'None provided') + criteriaSection);
   } else {
-    reviewerPrompt = `Review this plan (round ${nextRound}):\n\n${planContent}\n\nPrior issues: ${priorIssuesJson}`;
+    reviewerPrompt = `Review this plan (round ${nextRound}):\n\n${planContent}\n\nPrior issues: ${priorIssuesJson}${criteriaSection}`;
   }
 
   info(JSON.stringify({
@@ -992,6 +1058,59 @@ function getLatestPlanVersion(wsDir) {
     });
   if (planVersions.length === 0) die('No plan versions found in workspace.');
   return planVersions[planVersions.length - 1];
+}
+
+// ---------------------------------------------------------------------------
+// COMMAND: save-criteria (save criteria from Round 0 negotiation)
+// ---------------------------------------------------------------------------
+function cmdSaveCriteria(args) {
+  const wsDir    = args['workspace'];
+  const respPath = args['response'];
+  const phase    = args['phase'];  // 'propose' or 'challenge'
+
+  if (!wsDir)    die('--workspace <dir> is required');
+  if (!respPath) die('--response <file> is required');
+  if (!phase || !['propose', 'challenge'].includes(phase)) die('--phase must be "propose" or "challenge"');
+  if (!fs.existsSync(wsDir))    die(`Workspace not found: ${wsDir}`);
+  if (!fs.existsSync(respPath)) die(`Response file not found: ${respPath}`);
+
+  const meta = getWorkspaceMeta(wsDir);
+  const respContent = readFile(respPath);
+
+  // Parse JSON response (strip markdown fences if present)
+  let parsed;
+  try {
+    const cleaned = respContent.replace(/^```(?:json)?\s*/m, '').replace(/\s*```\s*$/m, '').trim();
+    parsed = JSON.parse(cleaned);
+  } catch (e) {
+    die(`Failed to parse criteria response: ${e.message}`, 1);
+  }
+
+  if (phase === 'propose') {
+    // Store proposed criteria, advance to challenge phase
+    writeJson(path.join(wsDir, 'criteria-proposed.json'), parsed);
+    meta.criteriaPhase = 'challenge';
+    writeJsonAtomic(path.join(wsDir, 'meta.json'), meta);
+    fs.appendFileSync(path.join(wsDir, 'changelog.md'),
+      `\n## Round 0a — Criteria Proposed — ${new Date().toISOString()}\n${parsed.criteria.length} criteria proposed\nScope: ${parsed.scope_boundary || 'not specified'}\n\n`, 'utf8');
+    info(JSON.stringify({ phase: 'propose', saved: true, criteriaCount: parsed.criteria.length }));
+  } else {
+    // Challenge phase: store final criteria, mark done
+    const finalCriteria = parsed.final_criteria || parsed.criteria || [];
+    writeJson(path.join(wsDir, 'criteria-final.json'), {
+      criteria: finalCriteria,
+      scope_boundary: parsed.scope_boundary || '',
+      challenges: parsed.challenges || [],
+    });
+    meta.criteria = finalCriteria;
+    meta.criteriaPhase = 'done';
+    writeJsonAtomic(path.join(wsDir, 'meta.json'), meta);
+    fs.appendFileSync(path.join(wsDir, 'changelog.md'),
+      `\n## Round 0b — Criteria Finalized — ${new Date().toISOString()}\n${finalCriteria.length} criteria agreed\nScope: ${parsed.scope_boundary || 'not specified'}\n\n`, 'utf8');
+    info(JSON.stringify({ phase: 'challenge', saved: true, criteriaCount: finalCriteria.length }));
+  }
+
+  return 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -1050,6 +1169,7 @@ Commands:
   status         Print current workspace state
   next-step      Get next action for autonomous loop (any mode)
   save-plan      Save a revised plan version from writer output
+  save-criteria  Save Round 0 criteria (propose or challenge phase)
 
 Global options:
   --help         Show this help
@@ -1122,7 +1242,8 @@ function main() {
     case 'finalize':    exitCode = cmdFinalize(args); break;
     case 'status':      exitCode = cmdStatus(args); break;
     case 'next-step':   exitCode = cmdNextStep(args); break;
-    case 'save-plan':   exitCode = cmdSavePlan(args); break;
+    case 'save-plan':      exitCode = cmdSavePlan(args); break;
+    case 'save-criteria':  exitCode = cmdSaveCriteria(args); break;
     default:
       console.error(`Unknown command: ${cmd}`);
       printHelp();
