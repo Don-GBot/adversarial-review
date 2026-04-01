@@ -21,19 +21,51 @@ Using it on trivial tasks adds overhead without benefit.
 ## Prerequisites
 
 - **Node.js >= 18.0.0** (uses `structuredClone`, `fs.readSync` on fd 0, etc.)
-- **OpenClaw** — the skill is invoked by the OpenClaw agent and relies on `sessions_spawn` for the reviewer
+- **One of the following agent runtimes:**
+  - **OpenClaw** — uses `sessions_spawn` for the reviewer
+  - **Claude Code** — uses the Codex plugin (`codex:codex-rescue` subagent) for cross-provider review
 - No npm install needed — zero external dependencies
 
 ---
 
 ## Quick Start
 
+### OpenClaw
+
 **Install from ClawHub:**
 ```
 /install cross-model-review
 ```
 
-**Trigger phrases** (say any of these with a plan in context):
+### Claude Code
+
+**Copy the skill to your Claude Code skills directory:**
+```bash
+# Clone the repo
+git clone https://github.com/Don-GBot/adversarial-review.git
+
+# Copy the Claude Code skill
+cp -r adversarial-review/claude-code ~/.claude/skills/cross-model-review
+
+# Also copy the shared scripts and templates (the skill needs them)
+cp -r adversarial-review/scripts ~/.claude/skills/cross-model-review/
+cp -r adversarial-review/templates ~/.claude/skills/cross-model-review/
+```
+
+**Or symlink for development:**
+```bash
+git clone https://github.com/Don-GBot/adversarial-review.git ~/adversarial-review
+ln -s ~/adversarial-review/claude-code ~/.claude/skills/cross-model-review
+# The SKILL.md references scripts/ and templates/ via relative paths from the repo
+```
+
+**Prerequisites for Claude Code:**
+- Codex CLI installed and authenticated: `npm install -g @openai/codex && codex login`
+- Codex plugin for Claude Code: `/plugin marketplace add openai/codex-plugin-cc && /plugin install codex@openai-codex`
+
+### Trigger phrases
+
+Say any of these with a plan in context:
 - "review this plan"
 - "cross review"
 - "challenge this"
@@ -285,9 +317,21 @@ node scripts/review.js init --plan "/my projects/plan.md" ...
 
 ---
 
+## Platform Support
+
+| Platform | Orchestrator | Cross-provider model |
+|----------|-------------|---------------------|
+| **OpenClaw** | `sessions_spawn` | Any supported model |
+| **Claude Code** | Agent tool + Codex plugin | Codex CLI (OpenAI) |
+
+The core state machine (`scripts/review.js`) is platform-agnostic — it manages workspaces, issue tracking, dedup, and verdicts. Each platform provides its own orchestration layer:
+
+- **OpenClaw**: `SKILL.md` (root) — uses `sessions_spawn` to invoke the reviewer
+- **Claude Code**: `claude-code/SKILL.md` — uses Codex plugin's `codex:codex-rescue` subagent for OpenAI models, executes Anthropic model prompts directly
+
 ## Publishing
 
-Built by Don-GBot for the OpenClaw ecosystem. v1.0.1 targets single-reviewer, sessions_spawn backend only. Parallel multi-reviewer and Codex CLI resume mode are v2 scope.
+Built by Don-GBot. Claude Code support contributed by wiziswiz.
 
 ClawHub slug: `cross-model-review`
-Tags: `code-review` `multi-model` `adversarial` `planning` `quality`
+Tags: `code-review` `multi-model` `adversarial` `planning` `quality` `claude-code` `codex`
