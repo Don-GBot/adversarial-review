@@ -1,13 +1,14 @@
 ---
 name: cross-model-review
-version: 1.0.0
+version: 1.1.0
 description: >
-  Adversarial plan review using two AI models from different providers.
-  Claude (Anthropic) plans, Codex (OpenAI) reviews — cross-provider blind spots surface real issues.
-  Supports static mode (fixed roles) and alternating mode (models swap writer/reviewer each round).
-  Triggers when: "review this plan", "cross review", "challenge this", "is this plan solid?",
-  "adversarial review", or user shares a plan and asks for second-opinion review.
+  Adversarial plan review orchestrator — forces disagreement between two AI providers to surface
+  blind spots neither would catch alone. Claude plans, Codex reviews (or they alternate roles).
+  Triggers when: user says "review this plan", "cross review", "challenge this", "is this plan solid?",
+  "adversarial review", shares a plan asking for second-opinion, or asks to sanity-check a multi-step
+  implementation. Also triggers on files in tasks/reviews/ or plan*.md files.
   NOT for: simple one-file fixes, research tasks, quick scripts, changes reversible in <5 minutes.
+argument-hint: "[plan file or inline plan text]"
 metadata:
   filePattern:
     - "**/tasks/reviews/**"
@@ -17,179 +18,115 @@ metadata:
     - "cross.model.review"
 ---
 
-# cross-model-review — Claude Code Skill
+# cross-model-review
 
-Adversarial plan review using two AI models from different providers.
-Claude (Anthropic) acts as planner, Codex (OpenAI) acts as reviewer — or they alternate roles.
+You are an adversarial review orchestrator. Your job is to force productive disagreement between two AI providers so that architectural blind spots, shared assumptions, and rubber-stamped decisions surface as structured, actionable issues before code gets written.
+
+## Why This Exists
+
+A model reviewing its own plan has a systematic blind spot — it agrees with the reasoning that generated the plan because the reasoning style is identical. A different model from a different provider was trained on different data with different RLHF preferences. That disagreement is the signal. You orchestrate the disagreement loop and make sure it converges on a stronger plan.
+
+## How to Think About This
+
+- **You are the referee, not a participant.** When you execute the Anthropic side, produce clean JSON/markdown output — don't editorialize. When Codex returns output, don't second-guess it — feed it to `review.js` and let the state machine decide.
+- **The value is in the delta.** Round 1 always finds issues. The real signal is what survives Round 2+ — those are the genuine blind spots.
+- **Convergence means both sides agree, not that issues disappeared.** If issues keep flip-flopping (Model A adds complexity, Model B strips it, Model A re-adds), the plan has a real ambiguity. Surface it to the user.
+- **Not every plan deserves this.** Auth, payments, data models, multi-service orchestration — yes. A CSS fix or README update — no. Use your judgment.
+
+## Skill Contents
+
+```
+cross-model-review/
+├── SKILL.md                  ← You are here
+├── scripts/
+│   └── review.js             ← State machine (1256 lines, zero deps)
+├── templates/
+│   ├── reviewer-prompt.md          ← Static mode reviewer
+│   ├── alternating-reviewer-prompt.md  ← Alternating mode (calibrated for proportionality)
+│   ├── writer-prompt.md            ← Plan rewriter
+│   ├── criteria-propose-prompt.md  ← Round 0: propose acceptance criteria
+│   └── criteria-challenge-prompt.md ← Round 0: challenge/refine criteria
+└── references/
+    ├── orchestration.md      ← Full loop pseudocode, model routing, delegation details
+    └── examples.md           ← Example review cycle output
+```
 
 ## Prerequisites
 
-- **Codex CLI** installed and authenticated (`codex --version` and `codex login`)
+- **Codex CLI** installed and authenticated (`codex --version` + `codex login`)
 - **Node.js >= 18.0.0**
-- The `scripts/review.js` state machine (ships with this skill, zero npm deps)
+- **Codex plugin** for Claude Code (`/plugin install codex@openai-codex`)
 
-## How It Works
-
-```
-User shares a plan
-       │
-       ▼
-┌──────────────────────────────────────────────┐
-│  Round N (max 5 static / 8 alternating)      │
-│                                              │
-│  1. next-step → get prompt + model           │
-│  2. If model is OpenAI family:               │
-│     → Delegate to Codex via codex-rescue     │
-│  3. If model is Anthropic family:            │
-│     → Execute directly (we are Claude)       │
-│  4. Save response → parse-round              │
-│  5. APPROVED? → finalize. REVISE? → loop.    │
-└──────────────────────────────────────────────┘
-```
-
-## Orchestration Contract
-
-You (Claude) are the orchestrator. You drive the loop by calling `review.js` subcommands
-and spawning sub-agents for the cross-provider model.
-
-### Step 0 — Save the plan
-
-The user provides a plan (inline or as a file). Save it to a temp file if inline.
-
-### Step 1 — Initialize workspace
-
-```bash
-# For alternating mode (recommended):
-node <skill-root>/scripts/review.js init \
-  --plan /path/to/plan.md \
-  --mode alternating \
-  --model-a "anthropic/claude-opus-4-6" \
-  --model-b "openai/gpt-5.4" \
-  --project-context "Brief description of what this plan implements" \
-  --out tasks/reviews
-
-# For static mode:
-node <skill-root>/scripts/review.js init \
-  --plan /path/to/plan.md \
-  --mode static \
-  --reviewer-model "openai/gpt-5.4" \
-  --planner-model "anthropic/claude-opus-4-6" \
-  --out tasks/reviews
-```
-
-Capture the workspace path from stdout.
-
-### Step 2 — The autonomous loop
+## Quick Mental Model
 
 ```
-while true:
-  step = run: node review.js next-step --workspace <ws>
-  parse step JSON
-
-  if step.action == "done":
-    break  → go to finalize
-
-  if step.action == "max-rounds":
-    ask user: override or manual fix
-    break
-
-  if step.action == "error":
-    report error to user, stop
-
-  if step.action == "criteria-propose":
-    # Round 0: Model A proposes acceptance criteria
-    # If model is Anthropic → execute prompt yourself
-    # If model is OpenAI → delegate to Codex
-    save response to temp file
-    run: node review.js save-criteria --workspace <ws> --phase propose --response <file>
-    continue
-
-  if step.action == "criteria-challenge":
-    # Round 0: Model B challenges/refines criteria
-    # Route to appropriate model
-    save response to temp file
-    run: node review.js save-criteria --workspace <ws> --phase challenge --response <file>
-    continue
-
-  if step.action == "review":
-    # Route based on step.model provider family
-    # OpenAI family → spawn Codex: delegate prompt via codex:codex-rescue subagent
-    #   System instruction: "Output ONLY valid JSON. No tool calls. No markdown fences."
-    # Anthropic family → execute prompt yourself, output JSON only
-    save raw response to: <ws>/round-<step.round>-response.json
-    run: node review.js parse-round --workspace <ws> --round <step.round> --response <file>
-    continue
-
-  if step.action == "revise":
-    # Route based on step.model provider family
-    # The writer rewrites the plan based on review feedback
-    # Save output to temp file
-    run: node review.js save-plan --workspace <ws> --plan <tempfile> --version <step.planVersion>
-    continue
+Plan → init workspace → [criteria negotiation] → review/revise loop → finalize
+                              Round 0                 Rounds 1-N
 ```
 
-### Step 3 — Finalize
+The state machine (`review.js next-step`) always tells you what to do next. You never need to track state yourself — just call `next-step`, route the prompt to the right model, save the response, and call the appropriate parse command.
 
-```bash
-node review.js finalize --workspace <ws>
-```
+### Model Routing
 
-Present to user: verdict, rounds taken, issues found/resolved, rubric scores, plan-final.md path.
-
-## Model Routing
-
-| Model family detected | Route to |
+| Model family keywords | Route to |
 |---|---|
-| `openai`, `gpt`, `codex`, `o1`, `o3` | Codex CLI via `codex:codex-rescue` subagent |
+| `openai`, `gpt`, `codex`, `o1`, `o3` | Codex via `codex:codex-rescue` subagent |
 | `anthropic`, `claude`, `sonnet`, `opus`, `haiku` | Execute directly (you are Claude) |
-| `google`, `gemini` | Not yet supported — future extension |
 | `unknown` | Warn user, attempt Codex as fallback |
 
-## Delegating to Codex
+### When You Execute as Claude
 
-When the step requires an OpenAI-family model, use the `codex:codex-rescue` subagent:
+Generate ONLY the required format — no preamble, no commentary:
+- **Review/criteria actions**: Raw JSON matching the schema
+- **Revise actions**: Complete plan as markdown
+
+### When You Delegate to Codex
 
 ```
 Agent(subagent_type="codex:codex-rescue", prompt=step.prompt)
 ```
 
-**For reviewer steps**: Prefix the prompt with the system instruction:
-"You are a senior engineering reviewer. Output ONLY valid JSON matching the schema. No tool calls. No markdown fences. No preamble."
+For reviewer/criteria steps, prefix with: "Output ONLY valid JSON matching the schema. No tool calls. No markdown fences. No preamble."
 
-**For writer steps**: The prompt from `next-step` is self-contained — pass it directly.
+For the full orchestration loop pseudocode, see `references/orchestration.md`.
 
-**For criteria steps**: Same as reviewer — JSON-only output required.
+## Gotchas
 
-## Executing as Claude
+- **`<skill-root>` must resolve to actual path.** Use the real path to this skill folder when calling `review.js` — e.g., `~/.claude/skills/cross-model-review/scripts/review.js`. The placeholder won't work.
+- **Codex tends to add preamble text before JSON.** `review.js` has `extractJson()` that handles this (strips fences, finds first `{...}` block), but if it still fails, re-prompt once with "Output ONLY the JSON. No other text."
+- **Reviewer says APPROVED but blockers remain — don't fight the override.** The script enforces: if CRITICAL/HIGH issues are still open, it overrides APPROVED to REVISE. This is correct. The reviewer hallucinated approval.
+- **Alternating mode with trivial plans creates artificial churn.** Plans under ~200 words or with < 3 implementation steps don't benefit from alternating. Use static mode or skip the review entirely.
+- **Force-approve in Claude Code requires `--ci-force`.** Claude Code runs non-interactively (no TTY), so the interactive CONFIRM prompt won't work. Always pass `--ci-force` alongside `--override-reason`.
+- **Round 0 criteria negotiation is optional but high-value for auth/payments.** It adds 2 extra model calls but produces task-specific acceptance criteria. Skip for generic features, always use for security-sensitive plans.
+- **Model names will age.** The init examples use current model names. If a model is deprecated, substitute the latest equivalent — the script only cares about provider family detection, not specific model versions.
+- **Workspace paths with spaces break without quotes.** Always quote `--plan` and `--workspace` arguments in bash commands.
+- **Don't re-read the plan yourself between rounds.** The state machine tracks plan versions (`plan-v1.md`, `plan-v2.md`, ...). Calling `next-step` gives you the right prompt with the right plan version baked in.
 
-When the step requires an Anthropic-family model, you execute the prompt yourself:
-- For review actions: Generate ONLY the JSON review schema. No other text.
-- For revise actions: Generate ONLY the complete revised plan as markdown.
-- For criteria actions: Generate ONLY the JSON criteria schema.
+## Anti-Patterns
 
-Save your output to the appropriate file before calling the next review.js subcommand.
-
-## Error Handling
-
-- **Codex timeout/failure**: Retry once. If it fails again, report to user.
-- **JSON parse error from reviewer**: Re-prompt once with: "Your response was not valid JSON. Please respond with ONLY the JSON schema specified."
-- **Max rounds hit**: Present unresolved issues to user. Offer force-approve with `--override-reason`.
-- **Same-provider rejection**: `review.js init` will reject if both models are from the same family.
+- **Don't run this on one-file fixes.** The overhead of criteria negotiation + 2-5 review rounds is not worth it for small changes.
+- **Don't force-approve without reading the unresolved issues.** Present them to the user first. Force-approve is an escape hatch, not a skip button.
+- **Don't skip criteria negotiation for auth/payments/data plans.** The generic rubric catches structural issues, but task-specific criteria catch domain-specific gaps.
+- **Don't manually track round state.** Always call `next-step` — it's the single source of truth. Trying to infer "what round are we on" from file names will break.
+- **Don't edit workspace files directly.** Use `save-plan`, `save-criteria`, `parse-round` — they maintain atomicity and update meta.json correctly.
 
 ## Presenting Results
 
-After finalize, show the user:
-1. **Verdict** (APPROVED / FORCE_APPROVED)
-2. **Rounds taken** and models used
-3. **Issue summary** — total found, resolved, by severity
-4. **Rubric scores** — per-dimension scores with rationale
-5. **Final plan location** — path to `plan-final.md`
-6. **Any force-approve details** if applicable
+After finalize, show the user a concise summary:
+
+1. **Verdict** — APPROVED / FORCE_APPROVED
+2. **Rounds** — how many, which models
+3. **Issues** — total found, resolved, unresolved, by severity
+4. **Rubric** — per-dimension scores (security, data integrity, concurrency, error handling, scalability, completeness, maintainability, differentiation)
+5. **Final plan** — path to `plan-final.md`
+6. **Force-approve audit** — if applicable, who, why, which issues bypassed
 
 ## Notes
 
-- `review.js` is the state machine — always call `next-step` to determine what to do next
-- All workspace state is in `tasks/reviews/<timestamp>/` — fully auditable
-- Cross-provider enforcement: models must be from different families
+- `review.js` is platform-agnostic — works with OpenClaw (`sessions_spawn`) and Claude Code (Agent tool)
+- All workspace state persists in `tasks/reviews/<timestamp>/` — fully auditable
+- Cross-provider enforcement: models must be from different provider families
 - Prompt injection protection: plan content wrapped in `<<<UNTRUSTED_PLAN_CONTENT>>>` delimiters
-- The skill works with both OpenClaw (`sessions_spawn`) and Claude Code (Agent tool) — same `review.js`, different orchestrators
+- Issue dedup uses Jaccard similarity (threshold 0.6) — flags but never auto-merges
+- For detailed orchestration pseudocode: `references/orchestration.md`
+- For example output from a 2-round review: `references/examples.md`
