@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 /**
- * review.js — Cross-model review helper for OpenClaw cross-model-review skill
+ * review.js — Cross-model review state machine (platform-agnostic)
+ *
+ * Works with: OpenClaw (sessions_spawn), Claude Code (Agent tool + Codex plugin)
  *
  * Subcommands:
  *   init         Create a review workspace
