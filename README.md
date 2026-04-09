@@ -88,8 +88,8 @@ $ cat /tmp/review-1234/plan.md
 # Step 2: initialize workspace
 $ node scripts/review.js init \
     --plan /tmp/review-1234/plan.md \
-    --reviewer-model openai/gpt-4 \
-    --planner-model anthropic/claude-sonnet-4-6 \
+    --reviewer-model openai-codex/gpt-5.4 \
+    --planner-model anthropic/claude-opus-4-6 \
     --out tasks/reviews
 tasks/reviews/2026-02-21T15-00-00-a1b2c3d4
 
@@ -174,7 +174,46 @@ Present unresolved issues → ask user to override or manually revise
 
 **Cross-provider enforcement:** reviewer and planner must be from different provider families (e.g. Anthropic + OpenAI). Same-provider reviews are rejected. Unrecognized model IDs produce a warning but are allowed — you are responsible for ensuring actual cross-provider separation.
 
+**Same-provider fallback is not equivalent:** if one side fails, do not silently replace it with another model from the same provider family and still call the result adversarial review. The disagreement signal comes from real cross-provider tension.
+
 **Prompt injection protection:** plan content is always wrapped in `<<<UNTRUSTED_PLAN_CONTENT>>>` delimiters and the reviewer is instructed to treat it as data only.
+
+---
+
+## Round 0: Criteria Negotiation
+
+Before the first real review round, the state machine now negotiates task-specific acceptance criteria.
+
+Fresh workspaces follow this sequence:
+
+1. `criteria-propose`
+2. `criteria-challenge`
+3. `review`
+4. `revise`
+5. `done` or `max-rounds`
+
+This matters because later review prompts are calibrated against the agreed acceptance bar, not just the raw plan.
+
+Minimal CLI flow:
+
+```bash
+# Step 1: inspect next action
+node scripts/review.js next-step --workspace tasks/reviews/<run>
+
+# Step 2: save proposal JSON from the proposing model
+node scripts/review.js save-criteria \
+  --workspace tasks/reviews/<run> \
+  --response /tmp/criteria-propose.json \
+  --phase propose
+
+# Step 3: inspect next action again, then save challenge/final JSON
+node scripts/review.js save-criteria \
+  --workspace tasks/reviews/<run> \
+  --response /tmp/criteria-challenge.json \
+  --phase challenge
+```
+
+Older workspaces remain backward-compatible. If `criteriaPhase` is missing in `meta.json`, the engine skips Round 0 and proceeds directly into the normal review loop.
 
 ---
 
@@ -190,10 +229,12 @@ A different model from a different provider was trained on different data, with 
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| Reviewer model | `openai/gpt-4` | Must be different provider from planner |
+| Reviewer model | `openai-codex/gpt-5.4` | Must be different provider from planner |
 | Planner model | Your current model | Detected automatically |
 | Max rounds | `5` | Override via `--max-rounds` in `init` |
 | Token budget | `8000` | For codebase context via `--token-budget` in `init` |
+
+Examples should use a real cross-provider pairing. One current example is `openai-codex/gpt-5.4` as reviewer with `anthropic/claude-opus-4-6` as planner, but model selection is still configurable.
 
 To use a different reviewer model, ask: *"cross review this plan using gemini as reviewer"*
 
@@ -222,8 +263,8 @@ tasks/reviews/2026-02-21T15-00-00-abc12345/
 ```json
 {
   "rounds": 2,
-  "plannerModel": "anthropic/claude-sonnet-4-6",
-  "reviewerModel": "openai/gpt-4",
+  "plannerModel": "anthropic/claude-opus-4-6",
+  "reviewerModel": "openai-codex/gpt-5.4",
   "totalIssuesFound": 2,
   "issuesBySeverity": { "critical": 0, "high": 1, "medium": 1, "low": 0 },
   "issuesResolved": 2,
@@ -299,6 +340,9 @@ Dedup: script flags new issues with Jaccard similarity ≥ 0.6 vs open issues AN
 
 **Parse failure (exit code 2 from parse-round)**
 The reviewer returned malformed JSON. `review.js` will print the schema errors. Re-prompt the reviewer with: "Your response was not valid JSON. Please respond with ONLY the JSON schema specified, no other text." If it fails twice, stop and escalate.
+
+**Malformed JSON, empty output, or a stalled round**
+Do not assume the review logic is wrong. First verify that the model execution path itself is healthy. Transport or runtime-path failures can look like review failures.
 
 **Reviewer timeout or model unavailable**
 The spawned reviewer session did not return a response within the timeout. Retry once with the same model. If it fails again, consider switching reviewer models via a fresh `init` with `--reviewer-model`. Do not proceed to coding-agent without a valid review.

@@ -68,7 +68,7 @@ node review.js init \
   --plan /path/to/plan.md \
   --mode alternating \
   --model-a "anthropic/claude-opus-4-6" \
-  --model-b "openai-codex/gpt-5.3-codex" \
+  --model-b "openai-codex/gpt-5.4" \
   --project-context "Brief description for reviewer calibration" \
   --out /home/ubuntu/clawd/tasks/reviews
 ```
@@ -76,6 +76,8 @@ node review.js init \
 Captures workspace path from stdout.
 
 ### Step 2 — The autonomous loop
+
+Round 0 now negotiates task-specific acceptance criteria before the first real review round. Do not skip it.
 
 ```
 while true:
@@ -87,6 +89,18 @@ while true:
   if step.action == "max-rounds":
     ask user: override or manual fix
     break
+
+  if step.action == "criteria-propose":
+    spawn sub-agent with step.model, step.prompt
+    save response to workspace/criteria-propose-response.json
+    save-criteria(workspace, response, phase="propose")
+    continue
+
+  if step.action == "criteria-challenge":
+    spawn sub-agent with step.model, step.prompt
+    save response to workspace/criteria-challenge-response.json
+    save-criteria(workspace, response, phase="challenge")
+    continue
 
   if step.action == "review":
     spawn sub-agent with step.model, step.prompt
@@ -119,6 +133,7 @@ Commands:
   init           Create a review workspace
   next-step      Get next action for autonomous loop
   parse-round    Parse a reviewer response, update issue tracker
+  save-criteria  Save Round 0 criteria negotiation output
   save-plan      Save a revised plan version from writer output
   finalize       Generate plan-final.md, changelog.md, summary.json
   status         Print current workspace state
@@ -138,12 +153,17 @@ init options:
 next-step options:
   --workspace <dir>        Path to review workspace (required)
   Returns JSON: { action, model, round, prompt, planVersion, saveTo }
-  Actions: "review", "revise", "done", "max-rounds"
+  Actions: "criteria-propose", "criteria-challenge", "review", "revise", "done", "max-rounds"
 
 parse-round options:
   --workspace <dir>        Path to review workspace (required)
   --round <n>              Round number (required)
   --response <file>        Path to raw reviewer response (required)
+
+save-criteria options:
+  --workspace <dir>        Path to review workspace (required)
+  --response <file>        Path to raw criteria response (required)
+  --phase <p>              "propose" or "challenge" (required)
 
 save-plan options:
   --workspace <dir>        Path to review workspace (required)
@@ -168,6 +188,15 @@ Exit codes:
 
 ## Detailed Orchestration (for agent implementation)
 
+### Spawning criteria rounds
+```
+step = next-step(workspace)  # action: "criteria-propose" or "criteria-challenge"
+response = sessions_spawn(model=step.model, task=step.prompt, timeout=120s)
+# Save raw response to workspace/criteria-propose-response.json or criteria-challenge-response.json
+# Then call save-criteria with phase="propose" or phase="challenge" based on step.action
+save-criteria(workspace, response_file, phase)
+```
+
 ### Spawning reviewers
 ```
 step = next-step(workspace)  # action: "review"
@@ -191,7 +220,10 @@ System instruction for writer: none needed — the prompt is self-contained.
 ### Error handling
 - Reviewer timeout/failure: retry once, then ask user
 - Writer timeout/failure: retry once, then ask user
+- Criteria JSON parse failure: retry once before advancing phases
 - Parse error on review JSON: re-prompt reviewer once with "Your response was not valid JSON"
+- If one side returns malformed JSON, empty output, or stalls unexpectedly, suspect model-path or transport failure before blaming the review logic
+- Never silently swap to a same-provider fallback and still call it cross-model review
 - Max rounds hit: present status to user, ask for override or manual fix
 
 ### Convergence
@@ -230,8 +262,10 @@ Run cross-model-review first. Only proceed if exit code 0.
 ## Notes
 - Workspace persists in `tasks/reviews/` — referenceable later
 - `issues.json` tracks full lifecycle of all issues
-- `meta.json` stores mode, models, current round, verdict, needsRevision flag
+- `meta.json` stores mode, models, current round, verdict, needsRevision flag, and criteria negotiation state
 - `next-step` is the state machine — always call it to determine what to do
 - Dedup warnings help catch semantic drift across rounds
 - Models must be from different provider families (cross-provider enforcement)
+- Do not silently substitute Sonnet for Opus, or another OpenAI model for Codex/GPT, and still label it adversarial review
 - `--project-context` is injected into reviewer prompts for calibration
+- Before a high-stakes run on a newly changed model path, do a tiny JSON-only probe first if you suspect runtime instability

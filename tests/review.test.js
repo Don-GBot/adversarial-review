@@ -70,6 +70,16 @@ console.log('--- help ---');
   assert(r.stdout.includes('status'), 'help mentions status command');
   assert(r.stdout.includes('--max-rounds'), 'help mentions --max-rounds');
   assert(r.stdout.includes('--token-budget'), 'help mentions --token-budget');
+  assert(!r.stdout.includes('\n  run '), 'help does not advertise run command');
+}
+
+// Test: run command is intentionally unsupported
+console.log('\n--- run command rejected ---');
+{
+  const r = run('run --workspace /tmp/does-not-matter', { expectFail: true });
+  assert(!r.ok, 'run command is rejected');
+  assert(r.code === 2, 'run command exits with code 2');
+  assert((r.stderr || '').includes('Unknown command: run'), 'run command rejected as unknown');
 }
 
 // Test: init — success
@@ -109,6 +119,66 @@ const planPath = setup();
   const metaMR = JSON.parse(fs.readFileSync(path.join(wsDirMR, 'meta.json'), 'utf8'));
   assert(metaMR.maxRounds === 3, '--max-rounds 3 stored in meta.json');
   assert(metaMR.tokenBudget === 4000, '--token-budget 4000 stored in meta.json');
+
+  // Test: criteria negotiation flow
+  console.log('\n--- criteria negotiation flow ---');
+  const outDirCriteria = path.join(tmpDir, 'reviews-criteria');
+  const rCriteria = run(`init --plan ${planPath} --reviewer-model openai/codex --planner-model anthropic/sonnet --out ${outDirCriteria}`);
+  const wsDirCriteria = rCriteria.stdout;
+
+  const step1 = JSON.parse(run(`next-step --workspace ${wsDirCriteria}`).stdout);
+  assert(step1.action === 'criteria-propose', 'fresh workspace starts with criteria-propose');
+
+  const criteriaProposePath = path.join(tmpDir, 'criteria-propose.json');
+  fs.writeFileSync(criteriaProposePath, JSON.stringify({
+    criteria: [
+      { id: 'C1', description: 'Docs must match actual engine behavior', risk_if_missed: 'stale guidance' },
+      { id: 'C2', description: 'No local runtime assumptions in upstream repo', risk_if_missed: 'portability breakage' },
+    ],
+    scope_boundary: 'docs and tests only',
+  }));
+  run(`save-criteria --workspace ${wsDirCriteria} --response ${criteriaProposePath} --phase propose`);
+
+  const metaAfterPropose = JSON.parse(fs.readFileSync(path.join(wsDirCriteria, 'meta.json'), 'utf8'));
+  assert(metaAfterPropose.criteriaPhase === 'challenge', 'saving proposed criteria advances to challenge');
+
+  const step2 = JSON.parse(run(`next-step --workspace ${wsDirCriteria}`).stdout);
+  assert(step2.action === 'criteria-challenge', 'next-step moves to criteria-challenge');
+
+  const criteriaChallengePath = path.join(tmpDir, 'criteria-challenge.json');
+  fs.writeFileSync(criteriaChallengePath, JSON.stringify({
+    final_criteria: [
+      { id: 'C1', description: 'Docs must match actual engine behavior', risk_if_missed: 'stale guidance' },
+      { id: 'C2', description: 'No local runtime assumptions in upstream repo', risk_if_missed: 'portability breakage' },
+      { id: 'C3', description: 'Only docs/tests plus narrow code revert if needed', risk_if_missed: 'scope creep' },
+    ],
+    scope_boundary: 'docs/tests plus narrow code revert',
+    challenges: ['Do not add runtime harness code'],
+  }));
+  run(`save-criteria --workspace ${wsDirCriteria} --response ${criteriaChallengePath} --phase challenge`);
+
+  const metaAfterChallenge = JSON.parse(fs.readFileSync(path.join(wsDirCriteria, 'meta.json'), 'utf8'));
+  assert(metaAfterChallenge.criteriaPhase === 'done', 'saving final criteria marks criteria phase done');
+  assert(Array.isArray(metaAfterChallenge.criteria) && metaAfterChallenge.criteria.length === 3, 'finalized criteria stored in meta');
+
+  const step3 = JSON.parse(run(`next-step --workspace ${wsDirCriteria}`).stdout);
+  assert(['review', 'revise'].includes(step3.action), 'post-criteria next-step advances into main review loop');
+  assert((step3.prompt || '').includes('Task-Specific Acceptance Criteria'), 'later prompt includes finalized criteria section');
+  assert((step3.prompt || '').includes('Docs must match actual engine behavior'), 'later prompt includes finalized criteria data');
+
+  // Test: backward compatibility when criteriaPhase is missing
+  console.log('\n--- criteria backward compatibility ---');
+  const outDirLegacy = path.join(tmpDir, 'reviews-legacy');
+  const rLegacy = run(`init --plan ${planPath} --reviewer-model openai/codex --planner-model anthropic/sonnet --out ${outDirLegacy}`);
+  const wsDirLegacy = rLegacy.stdout;
+  const legacyMetaPath = path.join(wsDirLegacy, 'meta.json');
+  const legacyMeta = JSON.parse(fs.readFileSync(legacyMetaPath, 'utf8'));
+  delete legacyMeta.criteriaPhase;
+  delete legacyMeta.criteria;
+  fs.writeFileSync(legacyMetaPath, JSON.stringify(legacyMeta, null, 2));
+
+  const legacyStep = JSON.parse(run(`next-step --workspace ${wsDirLegacy}`).stdout);
+  assert(['review', 'revise', 'done', 'max-rounds'].includes(legacyStep.action), 'workspace with no criteriaPhase skips directly to legacy flow');
 
   // Test: parse-round
   console.log('\n--- parse-round ---');

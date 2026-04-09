@@ -1029,12 +1029,13 @@ function cmdNextStep(args) {
   }
 
   if (fs.existsSync(templatePath)) {
+    const contextWithCriteria = (meta.projectContext || 'None provided') + criteriaSection;
     reviewerPrompt = readFile(templatePath)
       .replace('{plan_content}', planContent)
       .replace('{round}', String(nextRound))
       .replace('{prior_issues_json}', priorIssuesJson)
-      .replace('{codebase_context_or_"None provided"}', meta.projectContext || 'None provided')
-      .replace('{project_context}', (meta.projectContext || 'None provided') + criteriaSection);
+      .replace('{codebase_context_or_"None provided"}', contextWithCriteria)
+      .replace('{project_context}', contextWithCriteria);
   } else {
     reviewerPrompt = `Review this plan (round ${nextRound}):\n\n${planContent}\n\nPrior issues: ${priorIssuesJson}${criteriaSection}`;
   }
@@ -1203,6 +1204,12 @@ status options:
 
 next-step options:
   --workspace <dir>        Path to review workspace (required)
+  Returns actions including: criteria-propose, criteria-challenge, review, revise, done, max-rounds
+
+save-criteria options:
+  --workspace <dir>        Path to review workspace (required)
+  --response <file>        Path to raw criteria response file (required)
+  --phase <p>              Criteria phase: propose or challenge
 
 save-plan options:
   --workspace <dir>        Path to review workspace (required)
@@ -1215,8 +1222,9 @@ Exit codes:
   2   Error (parse failure, bad flags, etc.)
 
 Examples:
-  node review.js init --plan /tmp/plan.md --reviewer-model openai/gpt-4 --planner-model anthropic/claude-sonnet-4-6
-  node review.js init --plan "/tmp/my plan.md" --reviewer-model openai/gpt-4 --planner-model anthropic/claude-sonnet-4-6 --max-rounds 3 --token-budget 4000
+  node review.js init --plan /tmp/plan.md --reviewer-model openai-codex/gpt-5.4 --planner-model anthropic/claude-opus-4-6
+  node review.js init --plan "/tmp/my plan.md" --mode alternating --model-a anthropic/claude-opus-4-6 --model-b openai-codex/gpt-5.4 --max-rounds 3 --token-budget 4000
+  node review.js save-criteria --workspace tasks/reviews/2025-01-01T00-00-00-abc123 --response /tmp/criteria.json --phase propose
   node review.js parse-round --workspace tasks/reviews/2025-01-01T00-00-00-abc123 --round 1 --response /tmp/resp.json
   node review.js finalize --workspace tasks/reviews/2025-01-01T00-00-00-abc123
   node review.js status --workspace tasks/reviews/2025-01-01T00-00-00-abc123
