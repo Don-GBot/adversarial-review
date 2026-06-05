@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Crossfire pre-push gate (from the cross-model-review skill).
+# Blocks push when the code audit finds blocking issues.
+# Bypass (logged): CROSSFIRE_SKIP=1 git push
+#
+# Install: point core.hooksPath at the skill's hooks dir, or symlink this file
+# into .git/hooks/pre-push. Set CROSSFIRE_GATE to the gate script path if the
+# skill is not at the default location below.
+set -euo pipefail
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+
+# Resolve the gate script: explicit override, else common skill install paths.
+GATE="${CROSSFIRE_GATE:-}"
+if [ -z "$GATE" ]; then
+  for cand in \
+    "$REPO_ROOT/skills/cross-model-review/scripts/crossfire-gate.js" \
+    "$REPO_ROOT/scripts/crossfire-gate.js"; do
+    if [ -f "$cand" ]; then GATE="$cand"; break; fi
+  done
+fi
+
+if [ -z "$GATE" ] || [ ! -f "$GATE" ]; then
+  echo "[pre-push] crossfire-gate.js not found; set CROSSFIRE_GATE. Skipping gate." >&2
+  exit 0
+fi
+
+CROSSFIRE_ROOT="$REPO_ROOT" node "$GATE"

@@ -1,2 +1,7 @@
 node_modules/
 *.test.json
+
+# Crossfire run artifacts + local audit specs
+data/
+audit/
+*.audit.md

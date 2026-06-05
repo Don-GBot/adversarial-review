@@ -1,7 +1,7 @@
 {
   "name": "cross-model-review",
-  "version": "2.1.0",
-  "description": "Adversarial plan review using two different AI models",
+  "version": "2.2.0",
+  "description": "Adversarial cross-model review for plans (review.js) and code (crossfire: two-phase audit, pre-push gate, autonomous fix loop)",
   "keywords": [
     "code-review",
     "multi-model",
