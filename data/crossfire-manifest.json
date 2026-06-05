@@ -1,0 +1,8 @@
+{
+  "spec": "audit/crossfire-merged-spec.md",
+  "files": [
+    "scripts/crossfire.js",
+    "scripts/crossfire-gate.js",
+    "scripts/crossfire-loop.js"
+  ]
+}

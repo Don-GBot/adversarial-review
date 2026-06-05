@@ -5,3 +5,12 @@ node_modules/
 data/
 audit/
 *.audit.md
+
+# ...but the gate manifest and the audit spec it references are the published
+# contract and MUST ship (a clone needs them for the pre-push gate to work).
+!data/
+data/*
+!data/crossfire-manifest.json
+!audit/
+audit/*
+!audit/crossfire-merged-spec.md

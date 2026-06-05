@@ -31,6 +31,45 @@ const MANIFEST = MANIFEST_OVERRIDDEN
 
 function log(msg) { console.error(`[crossfire-gate] ${msg}`); }
 
+// Pre-push diff awareness. A static manifest means "these files require audit",
+// but auditing them on EVERY push (including unrelated commits / automated backup
+// crons) is intolerable: each run is a multi-minute cross-model audit. So we only
+// audit when the commits actually being pushed touch a manifest file.
+//
+// git feeds pre-push hooks ref updates on stdin, one per line:
+//   <local_ref> <local_sha> <remote_ref> <remote_sha>
+// We diff <remote_sha>..<local_sha> per updated ref and union the changed paths.
+// FAIL-SAFE: if we cannot bound the diff (no stdin / new remote branch / git
+// error / interactive run), we return null and the caller audits conservatively.
+// We never SKIP on uncertainty — only on a concrete "nothing relevant changed".
+const ZERO_SHA = /^0+$/;
+function readPrePushStdin() {
+  try {
+    if (process.stdin.isTTY) return null; // interactive: no push payload
+    return fs.readFileSync(0, "utf8");
+  } catch {
+    return null; // unreadable -> conservative (audit)
+  }
+}
+function changedFilesForPush(root) {
+  const raw = readPrePushStdin();
+  if (raw === null) return null;
+  const lines = raw.split("\n").map((l) => l.trim()).filter(Boolean);
+  if (!lines.length) return null; // no ref data -> conservative audit
+  const changed = new Set();
+  for (const line of lines) {
+    const parts = line.split(/\s+/);
+    const localSha = parts[1];
+    const remoteSha = parts[3];
+    if (!localSha || ZERO_SHA.test(localSha)) continue; // branch delete: nothing to push-audit
+    if (!remoteSha || ZERO_SHA.test(remoteSha)) return null; // new remote branch: can't bound -> audit
+    const r = spawnSync("git", ["diff", "--name-only", `${remoteSha}..${localSha}`], { cwd: root, encoding: "utf8" });
+    if (r.status !== 0) return null; // git failed -> conservative audit
+    r.stdout.split("\n").map((s) => s.trim()).filter(Boolean).forEach((f) => changed.add(f));
+  }
+  return changed; // concrete set (possibly empty = nothing changed in pushed range)
+}
+
 // B-2: a stale/wrong CROSSFIRE_ROOT must not silently redirect the gate away
 // from the repo actually being pushed. If ROOT was overridden to somewhere other
 // than cwd, and cwd has its own pending default manifest, fail closed rather than
@@ -146,6 +185,28 @@ if (manifest.workspace) {
     log(`❌ Manifest "workspace" (${wsReal}) is outside the repo — failing closed.`);
     process.exit(1);
   }
+}
+
+// Diff gate: only run the (expensive) audit when this push actually touches an
+// audited file. Conservative fallback (null) audits anyway, preserving the
+// "can't be silently skipped" guarantee.
+const changed = changedFilesForPush(ROOT);
+if (changed !== null) {
+  // git diff yields ROOT-relative paths, but manifest `files` are interpreted by
+  // crossfire.js relative to `workspace` (default ROOT). Normalize each audited
+  // file to a ROOT-relative path before matching, or a workspace'd manifest
+  // (files=["a.js"], workspace="src") would never match git's "src/a.js" and the
+  // gate would silently skip a real change. Use forward slashes (git's format).
+  const wsRel = manifest.workspace ? path.relative(ROOT, path.resolve(ROOT, manifest.workspace)) : "";
+  const toRootRel = (f) => path.join(wsRel, f).split(path.sep).join("/");
+  const touched = files.filter((f) => changed.has(toRootRel(f)));
+  if (!touched.length) {
+    log(`No audited files changed in this push (${changed.size} file(s) changed, none in manifest) — allowing.`);
+    process.exit(0);
+  }
+  log(`Audited file(s) changed in this push (${touched.join(", ")}) — running crossfire.`);
+} else {
+  log("Could not bound the push diff — auditing the manifest conservatively.");
 }
 
 const args = [CROSSFIRE_JS, "--files", files.join(",")];
