@@ -41,6 +41,17 @@ const GATEWAY_TOKEN = (() => {
 const MODEL_PHASE1 = "openclaw";          // content agent (Opus primary)
 const MODEL_PHASE2 = "openclaw/market";   // market agent (Codex primary)
 
+// Per-call gateway timeout. Multi-file / large-spec audits routinely need more
+// than the old hard-coded 300s (the auditor is doing a full structural pass).
+// Override with CROSSFIRE_TIMEOUT_MS. Default 600s.
+const CALL_TIMEOUT_MS = parseInt(process.env.CROSSFIRE_TIMEOUT_MS || "600000", 10);
+// Response token budget. 16k truncated Phase 2 mid-report → the CROSSFIRE_VERDICT
+// footer never arrived → false BLOCK. Override with CROSSFIRE_MAX_TOKENS.
+const CALL_MAX_TOKENS = parseInt(process.env.CROSSFIRE_MAX_TOKENS || "32000", 10);
+// How many times to retry a call whose response was truncated (finish_reason
+// === "length"). Truncation is the root cause of missing-footer false blocks.
+const TRUNCATE_RETRIES = parseInt(process.env.CROSSFIRE_TRUNCATE_RETRIES || "2", 10);
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -190,28 +201,50 @@ function parseVerdict(phase1Result, phase2Result) {
   if (/^\s*PHASE 1 ERROR:/m.test(p1)) { v.block = true; v.reasons.push("Phase 1 auditor errored (could not verify)"); }
   if (/^\s*PHASE 2 ERROR:/m.test(p2)) { v.block = true; v.reasons.push("Phase 2 auditor errored (could not verify)"); }
 
-  // Defense in depth: use BOTH the machine-readable footer AND prose regex
-  // counting (with code fences stripped), then take the MAX. A model arithmetic
-  // slip in the footer summary must never suppress a detailed prose finding,
-  // and a missing footer must never let a finding through. Mismatches are
-  // flagged so the report shows the disagreement.
+  // Reconciliation contract (footer vs itemized prose):
+  //
+  //   ITEMIZED PROSE FINDINGS ARE THE BLOCKING AUTHORITY when the footer is
+  //   present and final. A blocking issue MUST appear as an itemized
+  //   `STATUS: FAIL` / `SEVERITY: CRITICAL|HIGH` line, because that is the only
+  //   thing a fixer can act on. A bare footer integer with no corresponding
+  //   itemized finding is unactionable — trusting it creates an UNBREAKABLE
+  //   STALL (the fixer can't locate a phantom, so the count never drops).
+  //
+  //   This is safe because TRUNCATION IS ALREADY CAUGHT: a cut-off response
+  //   makes parseVerdictLine() return null → we fail closed below. So if we
+  //   reach here with a present+final footer, the auditor output is COMPLETE,
+  //   which means the itemized findings are complete too. A footer count that
+  //   exceeds the itemized count is therefore a summary/arithmetic error, not a
+  //   hidden finding — and must not force a block (overcount = phantom).
+  //
+  //   The other direction (prose > footer) is also handled correctly: prose is
+  //   authoritative, so a footer slip claiming 0 can never suppress a real
+  //   itemized finding (undercount protection preserved).
+  //
+  //   Footer's remaining job: the presence/finality GATE (missing/non-final =
+  //   incomplete response = fail closed). Mismatches are flagged loudly so the
+  //   report still surfaces the disagreement for human review.
   const c1 = stripFences(p1);
   const proseP1Fail = countLabel(c1, "STATUS", "FAIL");
   const proseP1Warn = countLabel(c1, "STATUS", "WARN");
   const f1 = parseVerdictLine(p1, ["fail", "warn"]);
   if (!f1) { v.source = "regex"; v.block = true; v.reasons.push("Phase 1 verdict footer missing/non-final — failing closed (auditor response incomplete)"); }
-  v.p1Fail = Math.max(f1 ? f1.fail : 0, proseP1Fail);
+  // Itemized prose is authoritative for the blocking count. When the footer is
+  // ABSENT (f1 null) we've already failed closed above; prose still drives the
+  // reported count (max-with-0 = prose).
+  v.p1Fail = proseP1Fail;
   v.p1Warn = Math.max(f1 ? f1.warn : 0, proseP1Warn);
-  if (f1 && (f1.fail !== proseP1Fail)) v.reasons.push(`Phase 1 footer/prose FAIL mismatch (footer ${f1.fail} vs prose ${proseP1Fail}; used max)`);
+  if (f1 && (f1.fail !== proseP1Fail)) v.reasons.push(`Phase 1 footer/prose FAIL mismatch (footer ${f1.fail} vs prose ${proseP1Fail}; itemized prose authoritative → ${proseP1Fail})`);
 
   const c2 = stripFences(p2);
   const proseP2Crit = countLabel(c2, "SEVERITY", "CRITICAL");
   const proseP2High = countLabel(c2, "SEVERITY", "HIGH");
   const f2 = parseVerdictLine(p2, ["critical", "high"]);
   if (!f2) { v.source = "regex"; v.block = true; v.reasons.push("Phase 2 verdict footer missing/non-final — failing closed (auditor response incomplete)"); }
-  v.p2Critical = Math.max(f2 ? f2.critical : 0, proseP2Crit);
-  v.p2High = Math.max(f2 ? f2.high : 0, proseP2High);
-  if (f2 && (f2.critical !== proseP2Crit || f2.high !== proseP2High)) v.reasons.push(`Phase 2 footer/prose severity mismatch (footer C${f2.critical}/H${f2.high} vs prose C${proseP2Crit}/H${proseP2High}; used max)`);
+  // Itemized prose authoritative for blocking severities (same rationale as P1).
+  v.p2Critical = proseP2Crit;
+  v.p2High = proseP2High;
+  if (f2 && (f2.critical !== proseP2Crit || f2.high !== proseP2High)) v.reasons.push(`Phase 2 footer/prose severity mismatch (footer C${f2.critical}/H${f2.high} vs prose C${proseP2Crit}/H${proseP2High}; itemized prose authoritative → C${proseP2Crit}/H${proseP2High})`);
 
   if (v.p1Fail > 0) { v.block = true; v.reasons.push(`${v.p1Fail} Phase 1 FAIL (spec non-compliance)`); }
   if (v.p2Critical > 0) { v.block = true; v.reasons.push(`${v.p2Critical} Phase 2 CRITICAL bug(s)`); }
@@ -230,7 +263,8 @@ function formatVerdict(v) {
   ].join("\n");
 }
 
-function callModel(model, systemPrompt, userPrompt) {
+// Single gateway call. Resolves { content, finishReason }.
+function callModelOnce(model, systemPrompt, userPrompt) {
   return new Promise((resolve, reject) => {
     const body = JSON.stringify({
       model,
@@ -238,7 +272,7 @@ function callModel(model, systemPrompt, userPrompt) {
         { role: "system", content: systemPrompt },
         { role: "user", content: userPrompt },
       ],
-      max_tokens: 16384,
+      max_tokens: CALL_MAX_TOKENS,
     });
     const options = {
       hostname: "127.0.0.1",
@@ -250,7 +284,7 @@ function callModel(model, systemPrompt, userPrompt) {
         "Content-Length": Buffer.byteLength(body),
         ...(GATEWAY_TOKEN ? { "Authorization": `Bearer ${GATEWAY_TOKEN}` } : {}),
       },
-      timeout: 300000,
+      timeout: CALL_TIMEOUT_MS,
     };
     const req = http.request(options, (res) => {
       let data = "";
@@ -268,10 +302,11 @@ function callModel(model, systemPrompt, userPrompt) {
         try {
           const json = JSON.parse(data);
           const content = json.choices?.[0]?.message?.content;
+          const finishReason = json.choices?.[0]?.finish_reason || null;
           if (!content || content.length < 20) {
             return reject(new Error(`Empty or malformed response from gateway. Raw: ${data.slice(0, 300)}`));
           }
-          resolve(content);
+          resolve({ content, finishReason });
         } catch (e) {
           reject(new Error(`JSON parse error: ${e.message}. Raw: ${data.slice(0, 300)}`));
         }
@@ -284,10 +319,62 @@ function callModel(model, systemPrompt, userPrompt) {
         reject(e);
       }
     });
-    req.on("timeout", () => { req.destroy(); reject(new Error("Gateway timeout (300s)")); });
+    req.on("timeout", () => { req.destroy(); reject(new Error(`Gateway timeout (${Math.round(CALL_TIMEOUT_MS / 1000)}s)`)); });
     req.write(body);
     req.end();
   });
+}
+
+// Truncation-aware wrapper. A response cut off by max_tokens (finish_reason
+// "length") loses its trailing CROSSFIRE_VERDICT footer, which the gate then
+// reads as a missing-footer false BLOCK. Retry such calls before giving up so
+// the auditor gets a fair chance to finish. Returns the content string.
+//
+// ALSO retries TRANSIENT NETWORK errors (EPIPE/ECONNRESET/ETIMEDOUT/socket hang
+// up). Without this, a single broken pipe during a Phase 1/2 audit call throws
+// straight to PHASE N ERROR -> block -> the loop reads it as a non-source
+// "auditor errored" stall and escalates, killing an otherwise-healthy multi-round
+// run. The fixer leg already retries these; the auditor leg must match
+// (self-audit S-? / spec §2.3). Auth/404/explicit-gateway errors are NOT
+// retried — those are deterministic and retrying just wastes calls.
+const TRANSIENT_RE = /EPIPE|ECONNRESET|ETIMEDOUT|socket hang up|Gateway timeout|network|ENETUNREACH|EAI_AGAIN/i;
+function isTransient(err) {
+  const s = `${err && err.code ? err.code : ""} ${err && err.message ? err.message : ""}`;
+  return TRANSIENT_RE.test(s);
+}
+const NET_RETRIES = parseInt(process.env.CROSSFIRE_NET_RETRIES || "3", 10);
+const NET_RETRY_BASE_MS = parseInt(process.env.CROSSFIRE_NET_RETRY_BASE_MS || "2000", 10);
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+async function callModel(model, systemPrompt, userPrompt) {
+  let last = null;
+  for (let attempt = 0; attempt <= TRUNCATE_RETRIES; attempt++) {
+    // Inner bounded retry for transient network faults on THIS attempt.
+    let r = null;
+    for (let net = 0; net <= NET_RETRIES; net++) {
+      try {
+        r = await callModelOnce(model, systemPrompt, userPrompt);
+        break;
+      } catch (e) {
+        if (isTransient(e) && net < NET_RETRIES) {
+          const backoff = NET_RETRY_BASE_MS * Math.pow(2, net);
+          console.error(`   ⚠️  ${model} transient network error (${e.code || e.message}) — retry ${net + 1}/${NET_RETRIES} in ${backoff}ms...`);
+          await sleep(backoff);
+          continue;
+        }
+        throw e; // non-transient, or retries exhausted -> propagate (fails closed)
+      }
+    }
+    last = r;
+    if (r.finishReason !== "length") return r.content;
+    if (attempt < TRUNCATE_RETRIES) {
+      console.error(`   ⚠️  ${model} response truncated (finish_reason=length), retrying (${attempt + 1}/${TRUNCATE_RETRIES})...`);
+    }
+  }
+  // Exhausted retries: return the (still-truncated) content. The gate's
+  // fail-closed footer check will catch it; we did our best to avoid it.
+  console.error(`   ⚠️  ${model} still truncated after ${TRUNCATE_RETRIES} retries — verdict will fail closed.`);
+  return last.content;
 }
 
 // ---------------------------------------------------------------------------
@@ -605,4 +692,10 @@ ${phase2Result}
   console.log("\n✅ Crossfire PASS — no blocking findings.");
 }
 
-main().catch(e => { console.error("Fatal:", e.message); process.exit(1); });
+// Export internals for unit testing. Only auto-run main() when invoked
+// directly (node crossfire.js ...), never when require()'d by a test harness.
+module.exports = { parseVerdict, countLabel, parseVerdictLine, stripFences, isTransient };
+
+if (require.main === module) {
+  main().catch(e => { console.error("Fatal:", e.message); process.exit(1); });
+}

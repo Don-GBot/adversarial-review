@@ -41,6 +41,15 @@ const GATEWAY_TOKEN = (() => {
   } catch { return ""; }
 })();
 
+// Timeout / token budgets. The old 300s + 16k truncated large audits & fixes,
+// dropping the CROSSFIRE_VERDICT footer and producing missing-footer false
+// blocks that stalled the loop. Generous defaults; all env-overridable.
+const CROSSFIRE_TIMEOUT_MS = parseInt(process.env.CROSSFIRE_TIMEOUT_MS || "600000", 10);
+const CROSSFIRE_MAX_TOKENS = parseInt(process.env.CROSSFIRE_MAX_TOKENS || "32000", 10);
+const CROSSFIRE_TRUNCATE_RETRIES = parseInt(process.env.CROSSFIRE_TRUNCATE_RETRIES || "2", 10);
+const FIXER_TIMEOUT_MS = parseInt(process.env.CROSSFIRE_FIXER_TIMEOUT_MS || "600000", 10);
+const FIXER_MAX_TOKENS = parseInt(process.env.CROSSFIRE_FIXER_MAX_TOKENS || "32000", 10);
+
 // Alternating fixers: round 1 = Codex, round 2 = Opus, round 3 = Codex, ...
 // Why alternate (not just variety): a single fixer that fails to satisfy the
 // auditor tends to retry the SAME approach -> fix-thrash/stall. Swapping models
@@ -121,12 +130,12 @@ function callModelOnce(model, system, user) {
   return new Promise((resolve, reject) => {
     const body = JSON.stringify({ model, messages: [
       { role: "system", content: system }, { role: "user", content: user },
-    ], max_tokens: 16384 });
+    ], max_tokens: FIXER_MAX_TOKENS });
     const req = http.request({
       hostname: "127.0.0.1", port: GATEWAY_PORT, path: "/v1/chat/completions", method: "POST",
       headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body),
         ...(GATEWAY_TOKEN ? { Authorization: `Bearer ${GATEWAY_TOKEN}` } : {}) },
-      timeout: 300000,
+      timeout: FIXER_TIMEOUT_MS,
     }, (res) => {
       let data = ""; res.on("data", (c) => (data += c));
       res.on("end", () => {
@@ -152,7 +161,7 @@ function callModelOnce(model, system, user) {
     });
     req.on("timeout", () => {
       req.destroy();
-      const e = new Error("Fixer timeout (300s)");
+      const e = new Error(`Fixer timeout (${Math.round(FIXER_TIMEOUT_MS / 1000)}s)`);
       e.retryable = true;
       reject(e);
     });
@@ -191,7 +200,16 @@ function runCrossfire(opts, outPath) {
   if (opts.workspace) args.push("--workspace", opts.workspace);
   // 32MB buffer so a large audit report can't ENOBUFS into a null-status "block"
   // with empty findings (which would feed the fixer garbage). Surface r.error.
-  const r = spawnSync("node", args, { cwd: ROOT, encoding: "utf8", maxBuffer: 32 * 1024 * 1024 });
+  // Propagate the longer timeout / token budget to the spawned auditor so the
+  // child crossfire.js uses the same settings the loop expects (fixes the
+  // 300s/16k truncation that produced missing-footer false blocks).
+  const childEnv = {
+    ...process.env,
+    CROSSFIRE_TIMEOUT_MS: String(CROSSFIRE_TIMEOUT_MS),
+    CROSSFIRE_MAX_TOKENS: String(CROSSFIRE_MAX_TOKENS),
+    CROSSFIRE_TRUNCATE_RETRIES: String(CROSSFIRE_TRUNCATE_RETRIES),
+  };
+  const r = spawnSync("node", args, { cwd: ROOT, encoding: "utf8", maxBuffer: 32 * 1024 * 1024, env: childEnv });
   // crossfire exit: 0 pass, 2 block, 1 error
   const report = fs.existsSync(outPath) ? fs.readFileSync(outPath, "utf8") : "";
   return { status: r.status, error: r.error, stdout: r.stdout || "", stderr: r.stderr || "", report };
